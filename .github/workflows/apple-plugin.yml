@@ -1,0 +1,43 @@
+name: Apple plugin
+
+on:
+  push:
+    branches: [develop, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dsh-apple-sync
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: dsh-apple-sync
+      - uses: actions/checkout@v7
+        with:
+          repository: starpickerr/Alcor
+          ref: 9fd098b9cdc2420dd8e64227cbf0618ea8c89c08
+          path: Alcor
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: dsh-apple-sync/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Build and package
+        run: DEVELOPER_DIR="$(xcode-select -p)" npm pack
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apple-plugin-mac
+          path: dsh-apple-sync/alcor-apple-sync-*.tgz
+          if-no-files-found: error
