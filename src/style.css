@@ -1,9 +1,25 @@
 .apple-sync-settings, .apple-sync-review { --apple-sync-accent: var(--alcor-brand, var(--dsw-alias-state-business-primary)); color: var(--dsw-alias-label-primary); font-family: var(--dsw-font-family); font-size: 14px; line-height: 1.5; }
 .apple-sync-settings { max-width: 760px; width: 100%; padding-bottom: 12px; }
-.apple-sync-settings > h2, .apple-sync-panel > h2 { margin: 0 0 24px; font-size: 22px; font-weight: 600; letter-spacing: -.4px; }
-.apple-direct-permissions { margin-top: 20px; padding: 12px 16px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 11px; }
-.apple-direct-permissions > div { margin-top: 12px; }
-.apple-direct-source { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.apple-settings-heading, .apple-permission-entry-main, .apple-permission-write, .apple-permission-footer { display: flex; align-items: center; gap: 12px; }
+.apple-settings-heading { justify-content: space-between; flex-wrap: wrap; margin: 0 0 14px; }
+.apple-settings-heading h2, .apple-sync-panel > h2 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -.3px; }
+.apple-settings-card { border: 1px solid var(--dsw-alias-border-l3); border-radius: 16px; background: var(--dsw-alias-bg-layer-1); }
+.apple-permission-entry { padding: 14px 18px; }
+.apple-permission-entry + .apple-permission-entry, .apple-permission-footer { border-top: 1px solid var(--dsw-alias-border-l3); }
+.apple-permission-entry .apple-sync-service-icon { width: 36px; height: 36px; border-radius: 10px; }
+.apple-permission-entry .alcor-notice { margin-top: 8px; }
+.apple-settings-heading button, .apple-permission-entry-main button, .apple-sync-facts button { flex: none; }
+.apple-settings-text { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.apple-settings-text strong { font-size: 14px; font-weight: 600; }
+.apple-settings-text small, .apple-settings-caption { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.apple-permission-footer { justify-content: space-between; flex-wrap: wrap; padding: 12px 18px; }
+.apple-permission-footer button { margin-inline-start: auto; }
+.apple-sync-panel { margin-top: 28px; }
+.apple-settings-list { margin: 10px 0; padding: 0; list-style: none; border: 1px solid var(--dsw-alias-border-l3); border-radius: 10px; }
+.apple-settings-list-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+.apple-settings-list-row + .apple-settings-list-row { border-top: 1px solid var(--dsw-alias-border-l3); }
+.apple-settings-badges { display: flex; flex-wrap: wrap; justify-content: end; gap: 4px; }
+.apple-settings-tag { flex: none; padding: 2px 7px; border-radius: 5px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font-size: 11px; }
 .apple-sync-settings p, .apple-sync-review p { margin: 0; overflow-wrap: anywhere; }
 .apple-sync-connection { margin-top: 16px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 16px; padding: 22px; background: var(--dsw-alias-bg-layer-1); }
 .apple-sync-heading, .apple-sync-service, .apple-sync-actions, .apple-sync-metadata, .apple-sync-inbox-heading, .apple-sync-row-action { display: flex; align-items: center; }
@@ -42,9 +58,15 @@
 .apple-sync-notice > svg { flex: none; margin-top: 2px; }
 .apple-sync-notice strong { display: block; margin-bottom: 5px; color: var(--dsw-alias-label-primary); font-weight: 500; }
 .apple-sync-notice[data-tone=error] > svg { color: var(--dsw-alias-state-error-primary); }
-.apple-sync-readonly, .apple-sync-coverage, .apple-sync-diagnostic { margin-top: 16px; color: var(--dsw-alias-label-secondary); font-size: 12px; }
-.apple-sync-settings summary, .apple-sync-review summary { cursor: pointer; width: fit-content; }
-.apple-sync-settings details p, .apple-sync-review details p { margin-top: 8px; line-height: 1.7; }
+.apple-sync-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 18px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--dsw-alias-border-l3); }
+.apple-sync-facts dl { display: flex; flex: 1 1 auto; flex-wrap: wrap; gap: 10px 22px; margin: 0; }
+.apple-sync-facts dt { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.apple-sync-facts dd { margin: 3px 0 0; font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.apple-sync-facts button { margin-inline-start: auto; }
+.apple-sync-detail-section + .apple-sync-detail-section { margin-top: 22px; }
+.apple-sync-detail-section h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+.apple-sync-diagnostic { margin-top: 16px; }
+.apple-sync-review pre { margin: 10px 0 0; padding: 10px 12px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-secondary); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .apple-sync-success { display: flex; align-items: center; gap: 7px; margin-top: 14px !important; font-size: 12px; }
 .apple-sync-review { width: min(560px, 100%); max-height: 100%; gap: 0; padding: 0; }
 .apple-sync-review-header { display: flex; justify-content: space-between; align-items: center; padding: 20px 22px 16px; border-bottom: 1px solid var(--dsw-alias-border-l3); flex: none; }
@@ -84,3 +106,9 @@
 .apple-sync-progress-dot { width: 7px; height: 7px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 50%; margin: 4px; }
 .apple-sync-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 @media (max-width: 520px) { .apple-sync-connection { padding: 16px; } .apple-sync-actions { margin-left: auto; } .apple-sync-metadata { gap: 6px; flex-direction: column; align-items: flex-start; } .apple-sync-row { padding: 12px 10px; gap: 9px; } .apple-sync-row-action { font-size: 0; gap: 0; } .apple-sync-review-header { padding: 16px; } .apple-sync-review-body { padding: 20px 16px; } .apple-sync-review-footer { padding: 14px 16px 16px; } .apple-sync-review-footer > span { flex-basis: 100%; } .apple-sync-subject h3 { font-size: 21px; } }
+@media (max-width: 520px) {
+  .apple-permission-entry, .apple-permission-footer { padding-inline: 12px; }
+  .apple-permission-entry-main { gap: 8px; }
+  .apple-sync-facts button { margin-inline-start: 0; }
+  .apple-sync-review-footer > div { flex-wrap: wrap; justify-content: end; }
+}
