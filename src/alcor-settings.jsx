@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { Button, Modal, IconCheckOutlineRegular, IconChecklistOutlineRegular, IconClockOutlineRegular, IconWarningOutlineRegular, IconChevronRightOutlineRegular, IconCloseOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { connectionStatus, formatSyncTime, reviewItems, resolutionRequest, deletionPhaseLabel, canRestoreLocalItem, boundConflictPending, syncSource, reviewAction, needsDecision } from './presentation.js'
 import { createCategoryRebuildPage } from './category-rebuild-page.js'
+import { SettingsDialog } from './settings-dialog.jsx'
 
 export const inject = ['configForms', 'slots', 'remote']
 const authorizations = { not_determined: '同步前需要允许访问 Apple 日历或提醒事项。', denied: '请在 macOS 系统设置 → 隐私与安全性中允许完整访问。', restricted: '系统限制了访问权限。', write_only: '当前仅有写入权限，请在系统设置中允许完整访问。', unsupported: 'Apple 同步仅支持 macOS。', helper_missing: '系统连接组件未安装，请重新安装 Apple 同步插件。' }
@@ -25,6 +26,7 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
   const [rebuilding, setRebuilding] = useState(false)
   const [rebuildError, setRebuildError] = useState('')
   const [checked, setChecked] = useState(null)
+  const [showDiagnostic, setShowDiagnostic] = useState(false)
   const mounted = useRef(true)
   const rebuildPage = useRef(null)
   if (!rebuildPage.current) rebuildPage.current = createCategoryRebuildPage({ api, kind, appleId:item.apple_id })
@@ -47,6 +49,9 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
   const compare = review === 'compare_record'
   const detailsOnly = retained || categoryWaiting || item.source_check
   const single = item.type === 'operation' || item.kind === 'legacy_retained'
+  const diagnostic = item.type === 'scan_claim' ? item.claims.map(claim =>
+    [formatSyncTime(claim.started_at), claim.stage || claim.state, claim.group_id, claim.reason].filter(Boolean).join(' · ')
+  ) : !item.source_check && !['category_create', 'category_retained'].includes(item.type) && (item.reason || item.error)
   const actionable = !detailsOnly && !uncertain && (!compare || !!checked) && (single || item.type === 'record' || ['name', 'color', 'missing_source'].includes(item.kind))
   const title = rebuildPlan ? `确认创建空 Apple ${groupLabel}？` : detailsOnly ? '同步详情' : confirm ? `删除 Alcor ${groupLabel}？` : uncertain ? item.state === 'sending' ? '正在向 Apple 提交' : '请核对 Apple 操作结果' : item.type === 'operation' ? pendingDelete ? deletionPhaseLabel(item) : '等待同步' : '处理同步冲突'
   const apply = async () => {
@@ -81,9 +86,6 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
             : checked.status === 'gone' ? '该操作已结束，请刷新同步状态。' : checked.status === 'source_unavailable'
             ? '暂时无法完整读取原来源，请检查 Apple 账户和权限。'
             : `${checked.checked == null ? '' : `本次从 Apple 读到 ${checked.checked} 项，核实 ${checked.matched} 条关联，其中 ${checked.unchanged} 条内容一致。`}缺少能确认原操作结果的记录，已保留同步占用。`}</p>}
-          <details className="apple-sync-diagnostic"><summary>诊断详情</summary>
-            {item.claims.map(claim => <p key={claim.attempt_id}>{formatSyncTime(claim.started_at)} · {claim.stage || claim.state} · {claim.group_id}{claim.reason && ` · ${claim.reason}`}</p>)}
-          </details>
         </> : item.source_check ? <>
           <Notice tone="warning" className="apple-sync-notice">{item.reason}</Notice>
           {checked && <p role="status">{checked.status === 'present' ? `已在「${checked.source}」找到原项目。可重新同步以核对当前内容。` : `未在「${checked.source}」找到原项目。仍需核对是否被移动或删除，现有内容已保留。`}</p>}
@@ -120,7 +122,12 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
             })}
           </fieldset>}
         </>}
-        {item.type !== 'scan_claim' && !item.source_check && (item.reason || item.error) && <details className="apple-sync-diagnostic"><summary>查看具体原因</summary><Notice tone="warning">{item.reason || item.error}</Notice></details>}
+        {diagnostic && <div className="apple-sync-diagnostic">
+          <Button variant="outline" size="sm" aria-expanded={showDiagnostic} onClick={() => setShowDiagnostic(open => !open)}>
+            {showDiagnostic ? '收起诊断' : '查看诊断'}
+          </Button>
+          {showDiagnostic && <pre>{[].concat(diagnostic).join('\n')}</pre>}
+        </div>}
       </>}
       {error && <Notice tone="error" role="alert" className="apple-sync-error">{error}</Notice>}
     </div>
@@ -134,6 +141,33 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
   </Modal>
 }
 
+function coverageLabel(period) {
+  return [period.start, period.end].map(date => date.slice(0, 10).replaceAll('-', '/')).join(' – ')
+}
+
+function SyncDetails({ title, sources, issues, coverage, error, close }) {
+  return <SettingsDialog title={`${title}同步明细`} close={close}>
+    {!!(sources.length || issues.length) && <section className="apple-sync-detail-section">
+      <h3>只读来源</h3>
+      <p className="apple-settings-caption">可导入 Alcor，更改在 Apple 中完成。</p>
+      {!!sources.length && <ul className="apple-settings-list">{sources.map(source => <li key={source.id} className="apple-settings-list-row">
+        <div className="apple-settings-text"><strong>{source.title}</strong>{source.source && <small>{source.source}</small>}</div>
+        <span className="apple-settings-tag">只读</span>
+      </li>)}</ul>}
+      {issues.map(issue => <Notice key={issue.todo_id} tone="warning">{issue.reason}</Notice>)}
+    </section>}
+    {!!coverage.length && <section className="apple-sync-detail-section">
+      <h3>已同步的时间范围</h3>
+      <ul className="apple-settings-list">{coverage.map(period => <li key={`${period.start}:${period.checked_at}`} className="apple-settings-list-row">
+        <div className="apple-settings-text"><strong>{coverageLabel(period)}</strong>
+          <small>检查于 {formatSyncTime(period.checked_at)}</small></div>
+      </li>)}</ul>
+      <p className="apple-settings-caption">查看其他日期时按需加载，暂停同步时显示已保存的内容。</p>
+    </section>}
+    {error && <section className="apple-sync-detail-section"><h3>诊断</h3><pre>{error}</pre></section>}
+  </SettingsDialog>
+}
+
 function Connection({ kind, api }) {
   const title = kind === 'calendar' ? 'Apple 日历' : 'Apple 提醒事项'
   const [state, setState] = useState(null)
@@ -142,6 +176,7 @@ function Connection({ kind, api }) {
   const [notice, setNotice] = useState('')
   const [readError, setReadError] = useState('')
   const [selected, setSelected] = useState(null)
+  const [showDetails, setShowDetails] = useState(false)
   const revision = useRef(0)
   const working = useRef(false)
   const call = async (method, args = {}) => {
@@ -198,6 +233,11 @@ function Connection({ kind, api }) {
   const syncError = message || readError || (status.tone === 'error' ? state?.error : '')
   const current = items.find(item => item.key === selected)
   useEffect(() => { if (selected && !current) setSelected(null) }, [selected, current])
+  const readOnly = options.filter(source => !source.writable)
+  const readOnlyIssues = state?.readonly_issues ?? []
+  const coverage = kind === 'calendar' ? (state?.coverage ?? []).slice(-3).reverse() : []
+  const diagnostic = !syncError && !busy && state?.error && (!items.length || !!failed.length) ? state.error : ''
+  const hasDetails = !!(readOnly.length || readOnlyIssues.length || coverage.length || diagnostic)
   const Icon = kind === 'calendar' ? IconClockOutlineRegular : IconChecklistOutlineRegular
   return <section className="apple-sync-connection" aria-label={title}>
     <div className="apple-sync-heading"><div className="apple-sync-service"><span className="apple-sync-service-icon"><Icon size={22} /></span><div><h3>{title}</h3><span className="apple-sync-badge" data-tone={status.tone} role="status"><span className="apple-sync-dot" aria-hidden="true" />{status.label === '部分同步 · 待处理' && !items.some(needsDecision) ? '部分同步' : status.label}</span></div></div><div className="apple-sync-actions"><Button variant="outline" size="sm" disabled={busy || !active} onClick={() => void run(async () => setState(await call('disconnect')))}>暂停同步</Button><Button variant="primary" size="sm" disabled={busy || !state?.supported} onClick={() => void run(sync)}>{busy ? '处理中…' : '同步'}</Button></div></div>
@@ -214,9 +254,17 @@ function Connection({ kind, api }) {
       const rows = items.filter(item => needsDecision(item) === decision)
       return !!rows.length && <div key={String(decision)} className="apple-sync-inbox"><div className="apple-sync-inbox-heading"><h4>{decision ? '需要你确认' : '同步状态'} <span>{rows.length}</span></h4></div><div className="apple-sync-rows">{rows.map(item => <button type="button" key={item.key} className="apple-sync-row" disabled={busy} onClick={() => {setMessage(''); setSelected(item.key)}}><span className="apple-sync-row-icon" data-pending={item.type === 'operation'}>{item.type === 'operation' ? <IconClockOutlineRegular size={18} /> : <IconWarningOutlineRegular size={18} />}</span><span className="apple-sync-row-text"><strong>{item.title}</strong><span>{item.label}{item.source && ` · ${item.source}`}</span></span><span className="apple-sync-row-action">{decision ? '处理' : '查看'}<IconChevronRightOutlineRegular size={14} /></span></button>)}</div></div>
     })}
-    {!syncError && !busy && state?.error && !current && (!items.length || !!failed.length) && <details className="apple-sync-diagnostic"><summary>诊断详情</summary><p>{state.error}</p></details>}
-    {(options.some(item => !item.writable) || state?.readonly_issues?.length > 0) && <details className="apple-sync-readonly"><summary>只读来源{state?.readonly_issues?.length ? ` · ${state.readonly_issues.length} 项保留` : ''}</summary><Notice>只读内容可导入 Alcor；更改需在 Apple 中完成。</Notice>{state?.readonly_issues?.map(item => <Notice key={item.todo_id}>{item.reason}</Notice>)}</details>}
-    {kind === 'calendar' && !!state?.coverage?.length && <details className="apple-sync-coverage"><summary>已同步的时间范围</summary>{state.coverage.slice(-3).map(item => <p key={`${item.start}:${item.checked_at}`}>{item.start.slice(0,10)} — {item.end.slice(0,10)}</p>)}<Notice>查看其他日期时按需加载；暂停同步时显示已保存的内容。</Notice></details>}
+    {hasDetails && <div className="apple-sync-facts">
+      <dl>
+        {!!(readOnly.length || readOnlyIssues.length) && <div><dt>只读来源</dt><dd>{readOnly.length} 个来源{readOnlyIssues.length ? ` · ${readOnlyIssues.length} 项保留` : ''}</dd></div>}
+        {!!coverage.length && <div><dt>已同步的时间范围</dt><dd>{coverageLabel(coverage[0])}</dd></div>}
+      </dl>
+      <Button variant="outline" size="sm" aria-label={`查看${title}同步明细`} onClick={() => setShowDetails(true)}>
+        同步明细<IconChevronRightOutlineRegular size={14} aria-hidden="true" />
+      </Button>
+    </div>}
+    {showDetails && <SyncDetails title={title} sources={readOnly} issues={readOnlyIssues} coverage={coverage}
+      error={diagnostic} close={() => setShowDetails(false)} />}
     {notice && <Notice className="apple-sync-success" role="status"><IconCheckOutlineRegular size={16} />{notice}</Notice>}
     {current && <Review key={current.key} item={current} kind={kind} state={state} api={api} finishRebuild={value => { setState(value); setSelected(null); setNotice('空 Apple 容器已创建；原成员保留本地，尚未重新关联。') }} busy={busy} error={message} close={() => setSelected(null)} resolve={(choice, source, revision) => void run(async () => {const request = resolutionRequest(current,kind,choice,source)
       if (request.method === 'keep_legacy') {
@@ -241,5 +289,5 @@ function Connection({ kind, api }) {
 
 export function AlcorSettings({ api, view }) {
   if (view === 'summary') return '双向同步 Apple 日历与提醒事项，保留分类和清单。'
-  return <div className="apple-sync-panel"><h2>Apple 同步</h2><Connection kind="calendar" api={api} /><Connection kind="reminders" api={api} /></div>
+  return <div className="apple-sync-panel"><h2>Apple 同步设置</h2><Connection kind="calendar" api={api} /><Connection kind="reminders" api={api} /></div>
 }
