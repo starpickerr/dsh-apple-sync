@@ -140,11 +140,13 @@ def _held_operation(sync,operation_id):
     return False
 
 
-def finish_receipts(sync):
+def finish_receipts(sync, operation_id=None):
     """Existing outbox recovery: a completed native receipt can only finish locally."""
     finish=getattr(sync,'finish_approved_delete',None)
     with sync._connect() as db:
-        journals=[json.loads(row[0]) for row in db.execute("SELECT value FROM settings WHERE key LIKE 'approved-delete:%'")]
+        rows = (db.execute("SELECT value FROM settings WHERE key=?", ('approved-delete:'+operation_id,))
+                if operation_id is not None else db.execute("SELECT value FROM settings WHERE key LIKE 'approved-delete:%'"))
+        journals=[json.loads(row[0]) for row in rows]
     handled=set();categories=items=0;errors=[]
     for journal in journals:
         plan=journal.get('plan') or {};operation=journal.get('operation') or {}

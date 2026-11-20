@@ -157,7 +157,8 @@ def synchronize_categories(sync, service, kind):
     removed = 0
     conflicts = []
     from apple_sync.export_reservations import held_groups
-    held = held_groups(sync)
+    from apple_sync.group_scan_claims import ScanHeld, status as scan_status
+    held = held_groups(sync) | {row['group_id'] for row in scan_status(sync)}
     from apple_sync.category_rebuild import retained
     quarantined = set(held)|{row['old_group'] for row in retained(sync)}
     eligible_links = lambda: [link for link in sync._stored_links() if link['alcor_id'] not in local_only]
@@ -165,8 +166,6 @@ def synchronize_categories(sync, service, kind):
     occupied = {row['apple_id'] for row in previous if row['apple_id'] in sources}
     # Rebind a uniquely identified calendar before treating an old identifier as absent.
     for link in previous:
-        if link['apple_id'] in held:
-            continue
         if not link['enabled']:
             continue
         absence = sync._get('category-absence:'+link['apple_id'])
@@ -178,7 +177,7 @@ def synchronize_categories(sync, service, kind):
         apple = sources.get(link['apple_id'])
         snapshot_key = 'category-snapshot:' + link['apple_id']
         snapshot = sync._get(snapshot_key, {})
-        if link['alcor_id'] not in categories:
+        if link['alcor_id'] not in categories and link['apple_id'] not in held:
             mapped_records=[sync._local(row['todo_id' if reminder else 'alcor_id']) for row in sync._maps() if row[identity]==link['apple_id']]
             retained=[row for row in mapped_records if row is not None]
             if retained:
@@ -196,6 +195,10 @@ def synchronize_categories(sync, service, kind):
             candidates = [row for row in sources.values() if row['id'] not in occupied and
                           row['title']==(snapshot.get('title') or link['apple_name']) and
                           (not snapshot.get('source_id') or row.get('source_id')==snapshot['source_id'])]
+            if link['apple_id'] in held or any(row['id'] in held for row in candidates):
+                quarantined.update(row['id'] for row in candidates)
+                _category_wait(conflicts, link, '此关联涉及尚待核对的 Apple 来源')
+                continue
             if len(candidates)==1:
                 apple = candidates[0]
                 old_id = link['apple_id']
@@ -210,7 +213,7 @@ def synchronize_categories(sync, service, kind):
                             'kind':'unverified_empty_category','candidates':candidates,
                             'reason':'空分类没有日程身份可核对，已保留原关联；同名不能证明是同一分类，请核对来源'})
                         continue
-                    except UnverifiedCategoryIdentity as error:
+                    except (UnverifiedCategoryIdentity, ScanHeld) as error:
                         quarantined.update((old_id, apple['id']))
                         conflicts.append({'apple_id':old_id,'alcor_id':link['alcor_id'],
                             'kind':'unverified_category_identity','candidates':candidates,'reason':str(error)})
@@ -218,7 +221,6 @@ def synchronize_categories(sync, service, kind):
                 else:
                     from apple_sync.reminder_rebind import rebind
                     from apple_sync.calendar_rebind import UnverifiedCategoryIdentity
-                    from apple_sync.group_scan_claims import ScanHeld
                     try:rebind(sync,service,link,snapshot,apple)
                     except (UnverifiedCategoryIdentity,ScanHeld) as error:
                         quarantined.update((old_id,apple['id']))
@@ -265,6 +267,8 @@ def synchronize_categories(sync, service, kind):
                     'reason':absence_reason,
                     'kind':'missing_source','candidates':candidates})
                 continue
+        if link['apple_id'] in held:
+            continue
         if link['alcor_id'] in categories:
             try:
                 _bind_claimed_category(sync,service,kind,link,apple,record_observation=True)

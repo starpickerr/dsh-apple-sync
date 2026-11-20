@@ -89,6 +89,8 @@ class AppleWorker:
         if self.verification_no_apple:
             raise RuntimeError('Apple sync is disabled for this verification process')
         arguments = dict(arguments or {})
+        if method == 'sync' and 'background' in arguments:
+            raise ValueError('Background retries are managed by the sync worker')
         if (method in ('one_time', 'transfer_batch') and arguments.get('direction') == 'export'
                 or method in ('resolve_conflict', 'resolve_category_conflict') and arguments.get('choice') in ('keep_alcor', 'keep_apple')
                 or method in ('sync', 'start_sync') and any(arguments.get(key, False) is not False for key in ('confirm_deletions', 'confirm_local_deletions'))):
@@ -117,12 +119,31 @@ class AppleWorker:
         from apple_sync.category_rebuild import rebuild
         with manager._lock:
             return rebuild(manager,owner,kind,apple_id,source_id,snapshot)
-    def prepare_approved_export(self, method, arguments, operation_id):
+    def review_sync(self, kind, action, identity, revision=None):
+        if self.verification_no_apple:
+            raise RuntimeError('Apple sync is disabled for this verification process')
+        from apple_sync import sync_recovery
+        manager = self.managers[kind]
+        with manager._lock:
+            if action == 'keep_legacy':
+                return sync_recovery.keep_legacy(manager, kind, identity, revision)
+            methods = {'check_scan': sync_recovery.check_scan, 'check_missing': sync_recovery.check_missing, 'preview_legacy': sync_recovery.preview_legacy,
+                       'compare_record': sync_recovery.compare_record, 'compare_identity': sync_recovery.compare_identity}
+            if action not in methods or revision is not None:
+                raise ValueError('Unknown sync review action')
+            return methods[action](manager, kind, identity)
+
+    def prepare_approved_export(self, method, arguments, operation_id, revision=None):
         if self.verification_no_apple:
             raise RuntimeError('Apple sync is disabled for this verification process')
         from apple_sync.approved_export import prepare
         kind = arguments.get('kind', 'calendar')
-        return prepare(self.managers[kind], kind, method, arguments, operation_id)
+        proposal = prepare(self.managers[kind], kind, method, arguments, operation_id)
+        if revision is not None:
+            from apple_sync.sync_recovery import conflict_revision
+            if method != 'resolve_conflict' or proposal.get('mode') != 'conflict' or conflict_revision(proposal) != revision:
+                raise ValueError('同步内容或关联已变化，请重新比较')
+        return proposal
 
     def run_approved_export(self, plan):
         if self.verification_no_apple:
@@ -152,7 +173,7 @@ class AppleWorker:
             raise ValueError('receipt finish requires a bound conflict plan')
         return run(self.managers[kind], kind, plan, authorize)
 
-    def prepare_item_restore(self, kind, identity, operation_id):
+    def prepare_item_restore(self, kind, identity, operation_id, revision=None):
         if self.verification_no_apple:
             raise RuntimeError('Apple sync is disabled for this verification process')
         from apple_sync.item_restore import prepare
@@ -162,7 +183,7 @@ class AppleWorker:
                               'local_id':identity,'method':request['method'],'args':list(request['args']),'kwargs':request['kwargs']})
         owner=Peer('tasks' if kind=='reminders' else 'calendar',owner_call)
         with manager._lock:
-            return prepare(manager,owner,kind,identity,operation_id)
+            return prepare(manager,owner,kind,identity,operation_id,revision)
 
     def run_item_restore(self, kind, plan):
         if self.verification_no_apple:
@@ -263,7 +284,7 @@ def main():
     def execute(request):
         try:
             action = request['action']
-            if action not in ('direct', 'initialize', 'invoke', 'preview_category_rebuild', 'rebuild_category', 'prepare_approved_export', 'run_approved_export', 'prepare_approved_delete', 'run_approved_delete', 'prepare_item_restore', 'run_item_restore'):
+            if action not in ('direct', 'initialize', 'invoke', 'review_sync', 'preview_category_rebuild', 'rebuild_category', 'prepare_approved_export', 'run_approved_export', 'prepare_approved_delete', 'run_approved_delete', 'prepare_item_restore', 'run_item_restore'):
                 raise ValueError('Unknown Apple worker action')
             value = getattr(worker, action)(**request.get('input', {}))
             emit({'id': request['id'], 'ok': True, 'value': value})

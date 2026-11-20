@@ -11,7 +11,7 @@ import { BusinessWorker, resolveBusinessPython } from '../../Alcor/packages/alco
 import { frozenExportPlan, applePlanDetail } from '../../Alcor/packages/alcor-secretary/src/security-apple-export-gate.js'
 import { confirmMacDeletion } from '../../Alcor/packages/alcor-secretary/src/mac-delete-confirmation.js'
 import { createCategoryRebuildHost } from './category-rebuild-host.js'
-import { remote, requestSchema, itemRestoreSchema, boundConflictSchema, rebuildPreviewSchema, rebuildCommitSchema } from './remote.js'
+import { remote, requestSchema, itemRestoreSchema, boundConflictSchema, syncReviewSchema, rebuildPreviewSchema, rebuildCommitSchema } from './remote.js'
 import { initializeProfile } from '../../Alcor/packages/alcor-organizer/src/profile-migration.js'
 
 function assertCompatibleProfile(ctx) {
@@ -138,14 +138,14 @@ export default class AppleSync extends TypertRemoteService {
   // Owner identifies the data-access caller; only the separate prompt approves an Apple write.
   @Remote
   async resolveItemConflict(request) {
-    const input = boundConflictSchema.parse(request), invocation = this.ctx.invocation
+    const { revision, ...input } = boundConflictSchema.parse(request), invocation = this.ctx.invocation
     if (invocation?.peer?.principal?.kind !== 'owner') throw new Error('冲突处理仅供所有者页面使用。')
     const peer = invocation.peer, signal = AbortSignal.any([invocation.signal, peer.signal])
     const operation_id = createHash('sha256').update(randomUUID()).digest('hex')
     let live = true, phase = 'prepare', prepared
     const authorize = () => live && this.active && !signal.aborted && peer.principal.kind === 'owner' && phase !== 'confirming'
     try {
-      prepared = await this.prepareExport({ method: 'resolve_conflict', arguments: input, operation_id }, authorize)
+      prepared = await this.prepareExport({ method: 'resolve_conflict', arguments: input, operation_id, ...(revision && { revision }) }, authorize)
       if (input.choice === 'keep_alcor' && prepared.mode !== 'receipt_finish') {
         phase = 'confirming'
         if (await this.confirmConflict({ version: 1, operation_id, kind: 'apple-update', detail: applePlanDetail(prepared) }, signal) !== true)
@@ -157,6 +157,14 @@ export default class AppleSync extends TypertRemoteService {
       live = false
       this.preparedExports.delete(prepared?.mode === 'receipt_finish' ? prepared.plan.operation_id : operation_id)
     }
+  }
+
+  @Remote
+  reviewSync(request) {
+    const input = syncReviewSchema.parse(request), invocation = this.ctx.invocation
+    if (invocation?.peer?.principal?.kind !== 'owner' || invocation.signal.aborted || invocation.peer.signal.aborted)
+      throw new Error('同步核对仅供当前所有者页面使用。')
+    return this.worker.call('review_sync', input)
   }
 
   // Host-only methods: these are intentionally absent from Remote descriptors.

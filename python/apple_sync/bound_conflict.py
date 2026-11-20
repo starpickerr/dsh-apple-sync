@@ -121,7 +121,7 @@ def _prepare(sync, kind, arguments, operation_id):
         raise ValueError('both objects, exact binding, source and versions must still agree')
     inbound = None
     if choice == 'keep_alcor':
-        if not target.get('writable') or not native.get('writable') or not binding.get('can_modify') or not container.get('can_modify'):
+        if matching[0]['direction'] == 'import' or not target.get('writable') or not native.get('writable') or not binding.get('can_modify') or not container.get('can_modify'):
             raise PermissionError('Apple conflict target is not writable')
         if kind == 'reminders':
             from apple_sync.reminders import _supported

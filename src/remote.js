@@ -2,8 +2,14 @@ import { z } from 'zod'
 import { createTypertRemoteInfo } from '@deepseek-ai/dsh-typert-protocol/remote-info'
 
 export const requestSchema = z.object({ method: z.string().min(1).max(80), arguments: z.record(z.string(), z.json()).default({}) }).strict()
-export const itemRestoreSchema = z.object({ kind:z.enum(['calendar','reminders']), identity:z.string().min(1).max(500) }).strict()
-export const boundConflictSchema = z.object({ kind:z.enum(['calendar','reminders']), identity:z.string().min(1).max(500), choice:z.enum(['keep_apple','keep_alcor']) }).strict()
+const revision = z.string().regex(/^[a-f0-9]{64}$/)
+const syncIdentity = { kind:z.enum(['calendar','reminders']), identity:z.string().min(1).max(500) }
+export const itemRestoreSchema = z.object({ ...syncIdentity, revision:revision.optional() }).strict()
+export const boundConflictSchema = z.object({ ...syncIdentity, choice:z.enum(['keep_apple','keep_alcor']), revision:revision.optional() }).strict()
+export const syncReviewSchema = z.discriminatedUnion('action', [
+  z.object({ ...syncIdentity, action:z.enum(['check_scan','check_missing','preview_legacy','compare_record','compare_identity']) }).strict(),
+  z.object({ ...syncIdentity, action:z.literal('keep_legacy'), revision }).strict(),
+])
 export const rebuildPreviewSchema = z.object({ kind:z.enum(['calendar','reminders']), apple_id:z.string().min(1).max(500), source_id:z.string().min(1).max(500) }).strict()
 export const rebuildCommitSchema = z.object({ ticket:z.string().uuid() }).strict()
 export const remote = createTypertRemoteInfo({ package: '@alcor/apple-sync', methods: {
@@ -13,6 +19,9 @@ export const remote = createTypertRemoteInfo({ package: '@alcor/apple-sync', met
   },
   'alcorAppleSync/resolveItemConflict': { service:'alcorAppleSync', invocation:{kind:'direct'},
     parameters:[{name:'request',source:'json',codec:{mode:'strict',typeSymbol:'@alcor/apple-sync#boundConflict',create:()=>boundConflictSchema}}],
+    result:{mode:'strict',typeSymbol:'@alcor/apple-sync#result',create:()=>z.json()} },
+  'alcorAppleSync/reviewSync': { service:'alcorAppleSync', invocation:{kind:'direct'},
+    parameters:[{name:'request',source:'json',codec:{mode:'strict',typeSymbol:'@alcor/apple-sync#syncReview',create:()=>syncReviewSchema}}],
     result:{mode:'strict',typeSymbol:'@alcor/apple-sync#result',create:()=>z.json()} },
   'alcorAppleSync/restoreLocalItem': { service:'alcorAppleSync', invocation:{kind:'direct'},
     parameters:[{name:'request',source:'json',codec:{mode:'strict',typeSymbol:'@alcor/apple-sync#itemRestore',create:()=>itemRestoreSchema}}],

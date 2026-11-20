@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import math
 import threading
+import time
 
 import logging
 logger = logging.getLogger('stella.apple')
@@ -12,6 +15,41 @@ def report_sync_error(kind, phase, error):
     """Keep a caught EventKit failure visible in both the UI and desktop log."""
     logger.exception("[AppleSync] %s failed during %s", kind, phase)
     return f"{phase}失败：{error or type(error).__name__}"
+
+
+def record_sync_result(sync, counts, error=''):
+    checked = counts.get('checked_group_ids', [])
+    outcome = {'status': 'partial' if checked and counts['status'] == 'error' else counts['status'],
+               'checked_group_ids': checked,
+               'failed_group_ids': counts.get('failed_calendar_ids', counts.get('failed_list_ids', [])),
+               'checked_at': sync.clock()}
+    if counts.get('retrying_group_ids'):
+        outcome['retrying_group_ids'] = counts['retrying_group_ids']
+    with sync._connect() as db:
+        db.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                       [('error', json.dumps(error)), ('sync_result', json.dumps(outcome))])
+
+
+class SourceRetries:
+    def __init__(self):
+        self.failed = {}
+
+    def defer(self, group_id):
+        delay, _ = self.failed.get(group_id, (5, 0))
+        delay = min(delay * 2, 300)
+        self.failed[group_id] = (delay, time.monotonic() + delay)
+
+    def waiting(self, group_id):
+        return time.monotonic() < self.failed.get(group_id, (0, 0))[1]
+
+    def clear(self, group_id):
+        self.failed.pop(group_id, None)
+
+    def record(self, counts, selected):
+        self.failed = {key: wait for key, wait in self.failed.items() if key in selected}
+        if self.failed:
+            counts['retrying_group_ids'] = sorted(self.failed)
+            counts['retry_in'] = max(1, math.ceil(min(deadline for _, deadline in self.failed.values()) - time.monotonic()))
 
 
 class EventKitAutoRunner:
@@ -33,12 +71,14 @@ class EventKitAutoRunner:
 
         def poll():
             while not self.stop_event.is_set():
+                delay = self.interval
                 if self.connected():
                     try:
-                        self.sync()
+                        result = self.sync() or {}
+                        delay = min(delay, result.get('retry_in', delay))
                     except Exception:
                         logger.exception("EventKit %s poll failed", self.kind)
-                self.stop_event.wait(self.interval)
+                self.stop_event.wait(delay)
 
         def watch():
             while not self.stop_event.is_set():

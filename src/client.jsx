@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useSyncExternalStore } from 'react'
 import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
-import { withModeView } from '../../Alcor/packages/alcor-plugin-info/src/mode-view.jsx'
+import { uiMode, withModeView } from '../../Alcor/packages/alcor-plugin-info/src/mode-view.jsx'
 import noticeStyle from '../../Alcor/packages/alcor-plugin-info/src/notice.css'
 import { AlcorSettings } from './alcor-settings.jsx'
 import { directRemote } from './direct-remote.js'
@@ -10,8 +10,13 @@ import style from './style.css'
 const groups = [['calendar', '日历'], ['reminders', '提醒事项']]
 const authorization = { full_access: '已授权', denied: '访问已拒绝', not_determined: '待授权',
   restricted: '访问受系统限制', write_only: '仅有写入权限', helper_missing: '系统连接组件未安装', unsupported: '仅支持 macOS' }
+const subscribeMode = listener => {
+  window.addEventListener('alcor-mode-changed', listener)
+  return () => window.removeEventListener('alcor-mode-changed', listener)
+}
 
 export function Settings({ api, AlcorView, sync, view }) {
+  const mode = useSyncExternalStore(subscribeMode, uiMode)
   const [settings, setSettings] = useState(null)
   const [alcor, setAlcor] = useState(false)
   const [lists, setLists] = useState({})
@@ -38,8 +43,7 @@ export function Settings({ api, AlcorView, sync, view }) {
   useEffect(() => { if (view !== 'summary') void run(refresh) }, [api, view])
   if (view === 'summary') return '在 DSH 中查询和编辑 Apple 日历及提醒事项。安装 Alcor 后可启用双向同步。'
   const change = value => { setSettings(value); setSaved(false) }
-  return <div className="apple-sync-settings">
-    <h2>Apple 日历与提醒事项</h2>
+  const permissions = <>
     <p>勾选允许 DSH 对话访问的来源。关闭写入时仍可查询。</p>
     {groups.map(([kind, label]) => {
       const list = lists[kind]
@@ -73,7 +77,15 @@ export function Settings({ api, AlcorView, sync, view }) {
     <Button disabled={busy} variant="ghost" onClick={() => void run(refresh)}>刷新来源</Button>
     {saved && <p role="status">已保存</p>}
     {error && <p role="alert">{error}</p>}
-    {alcor && sync && <AlcorView api={sync} view={view} />}
+  </>
+  return <div className="apple-sync-settings">
+    {alcor && sync ? <>
+      <AlcorView api={sync} view={view} />
+      <details className="apple-direct-permissions" open={mode === 'dsh'}>
+        <summary>DSH 对话访问权限</summary>
+        <div>{permissions}</div>
+      </details>
+    </> : <><h2>Apple 日历与提醒事项</h2>{permissions}</>}
   </div>
 }
 
@@ -81,7 +93,7 @@ export const inject = ['configForms', 'slots', 'remote']
 export async function apply(ctx) {
   ctx.effect(() => {
     const element = document.createElement('style')
-    element.textContent = style + noticeStyle + '.apple-direct-source{display:flex;gap:8px;align-items:center;margin:8px 0}'
+    element.textContent = style + noticeStyle
     document.head.append(element)
     return () => element.remove()
   })

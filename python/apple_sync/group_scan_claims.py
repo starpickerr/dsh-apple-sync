@@ -82,7 +82,7 @@ def guard_scan_reservations(db, approved):
             raise ScanHeld('calendar scan holds this local item; approved export must wait')
 
 
-def acquire(sync, source_id, group_id, window):
+def acquire(sync, source_id, group_id, window, *, reading=False):
     identity(source_id, group_id)
     token = secrets.token_hex(32)
     from apple_sync.export_reservations import schema as export_schema
@@ -94,11 +94,37 @@ def acquire(sync, source_id, group_id, window):
             raise ScanHeld('approved export holds this calendar container')
         if exported and db.execute('SELECT 1 FROM ordinary_export_claims WHERE group_id=?', (group_id,)).fetchone():
             raise ScanHeld('ordinary Apple write is unfinished in this calendar container')
-        if db.execute('SELECT 1 FROM calendar_scan_groups WHERE group_id=?', (group_id,)).fetchone():
-            raise ScanHeld('calendar scan is unfinished; reconcile before rescanning')
-        db.execute('INSERT INTO calendar_scan_attempts VALUES (?,?,?,?,?,?,?)', (token, source_id, group_id, 'scanning', json.dumps(window), sync.clock(), '{}'))
+        prior = db.execute('SELECT attempt_id FROM calendar_scan_groups WHERE group_id=?', (group_id,)).fetchone()
+        if prior:
+            if not reading or not _release_reading(db, prior['attempt_id'], source_id):
+                raise ScanHeld('calendar scan is unfinished; reconcile before rescanning')
+        evidence = json.dumps({'stage': 'reading'}) if reading else '{}'
+        db.execute('INSERT INTO calendar_scan_attempts VALUES (?,?,?,?,?,?,?)', (token, source_id, group_id, 'scanning', json.dumps(window), sync.clock(), evidence))
         db.execute('INSERT INTO calendar_scan_groups VALUES (?,?,?)', (group_id, source_id, token))
     return token
+
+
+def _release_reading(db, token, source_id):
+    attempt = db.execute('SELECT a.state,a.evidence FROM calendar_scan_attempts a JOIN calendar_scan_groups g USING(attempt_id) '
+                         'WHERE a.attempt_id=? AND a.group_id=g.group_id AND a.source_id=g.source_id AND a.source_id=?',
+                         (token, source_id)).fetchone()
+    if (not attempt or attempt['state'] not in ('scanning', 'uncertain') or json.loads(attempt['evidence']) != {'stage': 'reading'}
+            or db.execute('SELECT 1 FROM calendar_scan_items WHERE attempt_id=?', (token,)).fetchone()):
+        return False
+    db.execute("UPDATE calendar_scan_attempts SET state='not_sent' WHERE attempt_id=?", (token,))
+    db.execute('DELETE FROM calendar_scan_groups WHERE attempt_id=?', (token,))
+    return True
+
+
+def begin_item_phase(sync, token):
+    with sync._connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        schema(db)
+        attempt = db.execute('SELECT state,evidence FROM calendar_scan_attempts JOIN calendar_scan_groups USING(attempt_id) '
+                             'WHERE attempt_id=?', (token,)).fetchone()
+        if not attempt or attempt['state'] != 'scanning' or json.loads(attempt['evidence']) != {'stage': 'reading'}:
+            raise ScanHeld('read-only scan was superseded before item processing')
+        db.execute("UPDATE calendar_scan_attempts SET evidence='{}' WHERE attempt_id=?", (token,))
 
 
 def claim_items(sync, token, local_ids):
@@ -106,7 +132,9 @@ def claim_items(sync, token, local_ids):
     with sync._connect() as db:
         db.execute('BEGIN IMMEDIATE')
         schema(db)
-        if not db.execute('SELECT 1 FROM calendar_scan_groups WHERE attempt_id=?', (token,)).fetchone():
+        attempt = db.execute('SELECT a.state,a.evidence FROM calendar_scan_attempts a JOIN calendar_scan_groups g USING(attempt_id) '
+                             'WHERE a.attempt_id=?', (token,)).fetchone()
+        if not attempt or attempt['state'] != 'scanning' or json.loads(attempt['evidence']).get('stage') == 'reading':
             raise ValueError('scan claim lost')
         exported = export_schema(db)
         for local_id in sorted(set(local_ids)):
@@ -129,7 +157,7 @@ def cancel_unstarted_scan(sync, token, source_id, group_id, window, reason):
         groups=[dict(row) for row in db.execute('SELECT * FROM calendar_scan_groups WHERE attempt_id=?',(token,))]
         if (not attempt or attempt['source_id']!=source_id or attempt['group_id']!=group_id or
                 attempt['state']!='scanning' or json.loads(attempt['window'])!=window or
-                json.loads(attempt['evidence'])!={} or
+                json.loads(attempt['evidence']) not in ({}, {'stage': 'reading'}) or
                 groups!=[{'group_id':group_id,'source_id':source_id,'attempt_id':token}] or
                 db.execute('SELECT 1 FROM calendar_scan_items WHERE attempt_id=?',(token,)).fetchone()):
             return False
