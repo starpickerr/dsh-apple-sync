@@ -1,6 +1,9 @@
 .apple-sync-settings, .apple-sync-review { --apple-sync-accent: var(--alcor-brand, var(--dsw-alias-state-business-primary)); color: var(--dsw-alias-label-primary); font-family: var(--dsw-font-family); font-size: 14px; line-height: 1.5; }
 .apple-sync-settings { max-width: 760px; width: 100%; padding-bottom: 12px; }
-.apple-sync-settings > h2 { margin: 0 0 24px; font-size: 22px; font-weight: 600; letter-spacing: -.4px; }
+.apple-sync-settings > h2, .apple-sync-panel > h2 { margin: 0 0 24px; font-size: 22px; font-weight: 600; letter-spacing: -.4px; }
+.apple-direct-permissions { margin-top: 20px; padding: 12px 16px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 11px; }
+.apple-direct-permissions > div { margin-top: 12px; }
+.apple-direct-source { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 .apple-sync-settings p, .apple-sync-review p { margin: 0; overflow-wrap: anywhere; }
 .apple-sync-connection { margin-top: 16px; border: 1px solid var(--dsw-alias-border-l3); border-radius: 16px; padding: 22px; background: var(--dsw-alias-bg-layer-1); }
 .apple-sync-heading, .apple-sync-service, .apple-sync-actions, .apple-sync-metadata, .apple-sync-inbox-heading, .apple-sync-row-action { display: flex; align-items: center; }
@@ -14,6 +17,9 @@
 .apple-sync-badge[data-tone=warning], .apple-sync-row-icon { color: var(--dsw-alias-state-warn-primary); }
 .apple-sync-badge[data-tone=error], .apple-sync-error, .apple-sync-danger-note { color: var(--dsw-alias-state-error-primary); }
 .apple-sync-actions { gap: 8px; }
+.apple-sync-differences { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: .875rem; margin-top: 12px; }
+.apple-sync-differences :is(th, td) { padding: 8px; text-align: start; overflow-wrap: anywhere; vertical-align: top; }
+.apple-sync-differences th:first-child { width: 22%; }
 .apple-sync-metadata { flex-wrap: wrap; gap: 4px 18px; margin: 16px 0 0; color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .apple-sync-metadata time { margin-left: 6px; font-variant-numeric: tabular-nums; }
 .apple-sync-inbox { margin-top: 22px; }

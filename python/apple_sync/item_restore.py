@@ -36,7 +36,7 @@ def _baseline(sync,kind,identity,connection=None):
     return result
 
 
-def prepare(sync,owner,kind,identity,operation_id=None):
+def prepare(sync,owner,kind,identity,operation_id=None,revision=None):
     from apple_sync.category_rebuild import guard_retained
     from apple_sync.calendar import _payload as calendar_payload
     from apple_sync.reminders import _payload as reminder_payload
@@ -48,9 +48,17 @@ def prepare(sync,owner,kind,identity,operation_id=None):
         _check_plan(journal['plan'],kind)
         if journal['plan']['local_id']!=identity:raise ValueError('restore journal target changed')
         return {'mode':'receipt_finish','plan':journal['plan']}
-    if not mapping or mapping['state']!='conflict' or sync._local(identity) is not None:
+    if not mapping or mapping['state'] not in ('conflict', 'pending_delete') or sync._local(identity) is not None:
         raise ValueError('仅支持本地已删除项目的保留 Apple 恢复，请重新核对')
+    legacy = None
+    if mapping['state'] == 'pending_delete':
+        from apple_sync.sync_recovery import legacy_observation
+        legacy = legacy_observation(sync, kind, identity)
+        if digest(legacy) != revision:
+            raise ValueError('Apple 内容或关联已变化，请重新核对')
     native=locate_remote(sync,mapping,kind)
+    if legacy and native != legacy['native']:
+        raise ValueError('Apple 内容或关联已变化，请重新核对')
     if not native:raise ValueError('Apple 项目不可用，无法恢复；双方证据已保留')
     inventory=sync.bridge.call('reminder_lists' if kind=='reminders' else 'calendars')
     groups={row['id']:row for row in inventory['lists' if kind=='reminders' else 'calendars']}

@@ -61,17 +61,17 @@ def _begin(sync, link, snapshot, new_category, source_id):
         if not rows: raise EmptyCategoryIdentity('calendar identity cannot be verified from an empty category')
         for group in (old_group,new_group):
             if db.execute('SELECT 1 FROM calendar_scan_groups WHERE group_id=?',(group,)).fetchone():
-                raise ValueError('calendar container is already being reconciled')
+                raise scans.ScanHeld('calendar container is already being reconciled')
             if exported and db.execute('SELECT 1 FROM trusted_export_reservations WHERE group_id=?',(group,)).fetchone():
-                raise ValueError('approved export holds a calendar container')
+                raise scans.ScanHeld('approved export holds a calendar container')
             if exported and db.execute('SELECT 1 FROM ordinary_export_claims WHERE group_id=?',(group,)).fetchone():
-                raise ValueError('ordinary calendar write is in progress')
+                raise scans.ScanHeld('ordinary calendar write is in progress')
         for row in rows:
             if db.execute('SELECT 1 FROM calendar_scan_items WHERE local_id=?',(row['alcor_id'],)).fetchone():
-                raise ValueError('calendar item is already being reconciled')
+                raise scans.ScanHeld('calendar item is already being reconciled')
             if exported and (db.execute('SELECT 1 FROM trusted_export_reservations WHERE local_id=?',(row['alcor_id'],)).fetchone()
                              or db.execute('SELECT 1 FROM ordinary_export_claims WHERE local_id=?',(row['alcor_id'],)).fetchone()):
-                raise ValueError('calendar item write is already in progress')
+                raise scans.ScanHeld('calendar item write is already in progress')
         doc={'version':1,'operation_id':operation_id,'old_group':old_group,'new_group':new_group,'source_id':source_id,
              'link':link,'snapshot':snapshot,'new_category':new_category,'mappings':rows,'tokens':tokens}
         for group,token in zip((old_group,new_group),tokens):

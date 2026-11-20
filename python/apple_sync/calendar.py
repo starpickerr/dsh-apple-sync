@@ -18,7 +18,7 @@ from apple_sync.contracts import bind_item,category_binding,process_operations,l
 from apple_sync.categories import synchronize_categories, synchronize_moves, reconcile_category_names, resolve_category_conflict, prime_bindings, verify_category_source
 from apple_sync.category_links import bidirectional_links, reconcile_names, validate_links
 from apple_sync.bridge import AppleCalendarBridge
-from apple_sync.runtime import report_sync_error
+from apple_sync.runtime import SourceRetries, record_sync_result, report_sync_error
 from apple_sync.timezones import normalize_timezone
 
 
@@ -84,6 +84,7 @@ class AppleCalendarSync:
         self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
         self._lock = threading.RLock()
         self._auto_started = False
+        self._source_retries = SourceRetries()
         with self._connect() as db:
             # A legacy or mixed schema must only be changed by the supervised cold migration.
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -247,8 +248,10 @@ class AppleCalendarSync:
                 "auto_enabled": bool(self._get("auto_enabled", True)), "sync_all": bool(self._get("sync_all", False)), "calendar_ids": selected,
                 "direction": self._get("direction", "bidirectional"), "calendars": calendars,
                 "categories": categories,
-                "range_state":self._get('last_range'),"coverage":self._get('coverage',[]),"last_success": self._get("last_success"), "error": listing_error or self._get("error", ""),
-                "conflicts": conflict_summaries([row for row in maps if row['state']=='conflict' or row['alcor_id'] in restoring or row['alcor_id'] in resolving], self.calendar.get_event, 'alcor_id', restoring, resolving),
+                "range_state":self._get('last_range'),"coverage":self._get('coverage',[]),"last_success": self._get("last_success"),
+                "error": listing_error or self._get("error", ""), "listing_error": listing_error, "sync_result": self._get('sync_result'),
+                "conflicts": conflict_summaries([row for row in maps if row['state']=='conflict' or row['alcor_id'] in restoring or row['alcor_id'] in resolving], self.calendar.get_event, 'alcor_id', restoring, resolving,
+                                                lambda identity: self._get('calendar-inbound-conflict:'+identity)),
                 "legacy_deletions": [dict(alcor_id=row['alcor_id'], reason='旧版删除尚未核对，Apple 日程及关联已保留。') for row in maps if row['state']=='pending_delete'],
                 "pending_deletions": sum(row["state"] == "pending_delete" for row in maps),
                 "pending_local_deletions": sum(row["state"] == "pending_local_delete" for row in maps),
@@ -277,7 +280,7 @@ class AppleCalendarSync:
                 self._set('connected', True)
                 self._set('auto_enabled', True)
                 self.resume_auto()
-                self._set('error', '')
+                record_sync_result(self, {'status': 'success'})
                 self._set('last_success', self.clock())
                 return {'state': self.status(), 'result': {'status': 'success', 'deleted_calendars': deleted_categories}}
             if sync_all and not state['calendars']:
@@ -913,7 +916,7 @@ class AppleCalendarSync:
             maps.append(mapping)
             counts["imported"] += 1
             return
-        if mapping["state"] in ("remote_deleted", "locally_deleted", "deleted"):
+        if mapping["state"] in ("remote_deleted", "locally_deleted", "deleted", "legacy_kept"):
             return
         capture = self.calendar.apple_capture_calendar_sync(mapping["alcor_id"], category_id if direction in ('import','bidirectional') else None)
         local = capture['local'] if capture else None
@@ -949,6 +952,9 @@ class AppleCalendarSync:
         if mapping["state"] == "conflict":
             return
         if local_changed and remote_changed:
+            from apple_sync.sync_merge import merge_bound_item
+            if merge_bound_item(self, 'calendar', mapping, capture, remote, previous_baseline, direction, scan_token, counts):
+                return
             self._conflict(mapping, "Both Alcor and Apple changed this event")
             counts["conflicts"] += 1
         elif remote_changed:
@@ -993,7 +999,7 @@ class AppleCalendarSync:
             self._commit_inbound_snapshot(mapping,before,previous_baseline,applied,remote,capture['generation'])
 
 
-    def sync(self, manual=False, confirm_deletions=False, confirm_local_deletions=False, scan_start=None, scan_end=None):
+    def sync(self, manual=False, confirm_deletions=False, confirm_local_deletions=False, scan_start=None, scan_end=None, *, background=False):
         if scan_start is not None or scan_end is not None:
             self._range(scan_start,scan_end)
         with self._lock:
@@ -1009,6 +1015,8 @@ class AppleCalendarSync:
             if native.get("authorization") != "full_access":
                 counts["status"] = native.get("authorization", "unavailable")
                 return counts
+            from apple_sync.sync_recovery import recover_receipts
+            recover_receipts(self, 'calendar')
             automatic_deletions = self._get("sync_deletions", False)
             confirm_deletions = confirm_deletions or automatic_deletions
             confirm_local_deletions = confirm_local_deletions or automatic_deletions
@@ -1017,7 +1025,7 @@ class AppleCalendarSync:
                     counts['deleted_categories'] = synchronize_categories(self, self.calendar, 'calendar')
                 except Exception as exc:
                     counts['status'] = 'error'
-                    self._set('error', report_sync_error('calendar', '同步分类', exc))
+                    record_sync_result(self, counts, report_sync_error('calendar', '同步分类', exc))
                     return counts
             if not self._get('sync_all',False):
                 _,errors = process_operations(self,self.calendar,'calendar')
@@ -1028,7 +1036,7 @@ class AppleCalendarSync:
                 counts['exported'] += synchronize_moves(self, self.calendar, 'calendar', lambda row, mapping, remote: _fingerprint(row, series=mapping['origin'] == 'alcor', remote=remote))
             except Exception as exc:
                 counts['status'] = 'error'
-                self._set('error', report_sync_error('calendar', '同步分类移动', exc))
+                record_sync_result(self, counts, report_sync_error('calendar', '同步分类移动', exc))
                 return counts
             stored_links = self._stored_links()
             using_links = bool(stored_links)
@@ -1052,12 +1060,18 @@ class AppleCalendarSync:
                 destinations = self.bridge.call('calendars')
             except Exception as exc:
                 counts['status'] = 'error'
-                self._set('error', report_sync_error('calendar', '读取同步来源', exc))
+                record_sync_result(self, counts, report_sync_error('calendar', '读取同步来源', exc))
                 return counts
             completed, held = [], []
             blocked_move_groups = {group for error in self._get('calendar_move_errors', []) for group in error['group_ids']}
             for group_id in dict.fromkeys(selected):
+                if background and self._source_retries.waiting(group_id):
+                    counts['failed_calendar_ids'].append(group_id)
+                    if counts['status'] != 'error':
+                        counts['status'] = 'partial'
+                    continue
                 if group_id in blocked_move_groups:
+                    self._source_retries.clear(group_id)
                     held.append(group_id)
                     counts['status'] = 'partial'
                     continue
@@ -1069,26 +1083,47 @@ class AppleCalendarSync:
                         target=next((row for row in destinations.get('calendars',[]) if row.get('id')==group_id),{})
                         if target:verify_category_source(self.calendar.get_category(link['alcor_id']),link,target)
                     target = scan_claims.destination(destinations, group_id)
-                    token = scan_claims.acquire(self, target['source_id'], group_id, window)
-                    fresh = scan_claims.destination(self.bridge.call('calendars'), group_id)
+                    token = scan_claims.acquire(self, target['source_id'], group_id, window, reading=True)
+                    try:
+                        current = self.bridge.call('calendars')
+                    except Exception as exc:
+                        raise scan_claims.ScanUnavailable(report_sync_error('calendar', '检查日历来源', exc)) from exc
+                    fresh = scan_claims.destination(current, group_id)
                     if fresh != target:
                         raise scan_claims.ScanUnavailable('calendar destination changed after claim')
                     if link:verify_category_source(self.calendar.get_category(link['alcor_id']),link,fresh)
+                    try:
+                        inventory = self.bridge.call('events', calendar_ids=[group_id], start=window[0], end=window[1])
+                    except Exception as exc:
+                        raise scan_claims.ScanUnavailable(report_sync_error('calendar', '读取日历项目', exc)) from exc
+                    if any(row.get('calendar_id') != group_id or row.get('source_id') != target['source_id']
+                           for row in inventory['events']):
+                        raise scan_claims.ScanUnavailable('Apple 日历返回的来源与关联不一致')
+                    scan_claims.begin_item_phase(self, token)
                     item_phase_started = True
                     result, safe = self._sync_claimed_calendar(
-                        group_id, target['source_id'], token, direction, window, using_links, enabled_links)
+                        group_id, target['source_id'], token, direction, window, using_links, enabled_links, inventory)
                     for key in ('imported','updated','exported','deleted_local','deleted_remote','conflicts','pending_deletions'):
                         counts[key] += result[key]
                     counts['failed_calendar_ids'].extend(result['failed_calendar_ids'])
+                    if result.get('error'):
+                        failures.append(result['error'])
                     if result['blocked_local_ids']:
                         counts.setdefault('blocked_local_ids', []).extend(result['blocked_local_ids'])
                     if result['status'] != 'success':
                         counts['status'] = 'error' if result['status'] == 'error' or counts['status'] == 'error' else 'partial'
                     if safe:
                         scan_claims.complete(self, token)
-                        completed.append(group_id)
+                        if not result['failed_calendar_ids']:
+                            self._source_retries.clear(group_id)
+                            completed.append(group_id)
+                        else:
+                            self._source_retries.defer(group_id)
                     else:
+                        self._source_retries.clear(group_id)
                         scan_claims.uncertain(self, token)
+                        if not result['failed_calendar_ids']:
+                            counts['failed_calendar_ids'].append(group_id)
                         held.append(group_id)
                 except scan_claims.ScanUnavailable as exc:
                     counts['failed_calendar_ids'].append(group_id)
@@ -1096,15 +1131,21 @@ class AppleCalendarSync:
                     if token and (item_phase_started or not scan_claims.cancel_unstarted_scan(self,token,target['source_id'],group_id,list(window),exc)):
                         scan_claims.uncertain(self, token)
                         held.append(group_id)
+                        self._source_retries.clear(group_id)
+                    else:
+                        self._source_retries.defer(group_id)
                     if counts['status'] != 'error':
                         counts['status'] = 'partial'
                 except scan_claims.ScanHeld:
+                    self._source_retries.clear(group_id)
                     held.append(group_id)
                     if token:
                         scan_claims.uncertain(self, token)
                     if counts['status'] != 'error':
                         counts['status'] = 'partial'
                 except Exception as exc:
+                    self._source_retries.clear(group_id)
+                    counts['failed_calendar_ids'].append(group_id)
                     if token:
                         scan_claims.uncertain(self, token)
                         held.append(group_id)
@@ -1114,6 +1155,8 @@ class AppleCalendarSync:
             if held:
                 counts['export_held_groups'] = sorted(set(held))
             counts['scan_claims'] = scan_claims.status(self)
+            counts['checked_group_ids'] = completed
+            self._source_retries.record(counts, selected)
             if name_errors and counts['status'] == 'success':
                 counts['status'] = 'error'
             if counts['status'] == 'success':
@@ -1121,10 +1164,8 @@ class AppleCalendarSync:
                 coverage.append({'start':window[0], 'end':window[1], 'checked_at':self.clock(), 'calendar_ids':sorted(completed)})
                 self._set('coverage', coverage[-100:])
                 self._set('last_success', self.clock())
-                self._set('error', '')
-            else:
-                self._set('error', failures[0] if failures else name_errors[0] if name_errors else
-                          '部分日历正在同步或结果待核对；其他日历继续同步，请先核对 Apple，不要重复发送。')
+            message = next(iter(failures or name_errors), '部分日历待核对或暂时无法读取')
+            record_sync_result(self, counts, '' if counts['status'] == 'success' else message)
             return counts
 
 
@@ -1199,7 +1240,7 @@ class AppleCalendarSync:
         with self._lock:
             if stop_event.is_set() or not self._get('auto_enabled', True) or not self._get('connected', False):
                 return None
-            return self.sync()
+            return self.sync(background=True)
 
     def stop_auto(self):
         if self._auto_started:
@@ -1425,7 +1466,7 @@ class AppleCalendarSync:
             db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',('calendar-identity-candidate:'+key,json.dumps(record,ensure_ascii=False)))
         return True
 
-    def _sync_claimed_calendar(self, group_id, source_id, token, direction, window, using_links, enabled_links):
+    def _sync_claimed_calendar(self, group_id, source_id, token, direction, window, using_links, enabled_links, inventory):
         selected = [group_id]
         failures, name_errors = [], []
         counts = {"status": "success", "imported": 0, "updated": 0, "exported": 0,
@@ -1433,15 +1474,12 @@ class AppleCalendarSync:
                   "pending_deletions": 0, "pending_local_deletions": 0,
                   "failed_calendar_ids": []}
         try:
-            inventory = self.bridge.call("events", calendar_ids=selected, start=window[0], end=window[1])
             successful = set(inventory["successful_calendar_ids"]) & set(selected)
             counts["failed_calendar_ids"] = sorted(set(selected) - successful)
             if counts["failed_calendar_ids"]:
                 with self._connect() as db:
                     db.executemany("UPDATE mappings SET missing_since='' WHERE calendar_id=?",
                                    [(key,) for key in counts["failed_calendar_ids"]])
-            if any(row.get('calendar_id') != group_id or row.get('source_id') != source_id for row in inventory['events']):
-                raise ValueError('scan returned an untrusted source or container identity')
             from apple_sync.group_scan_claims import claim_items, verify_binding, ScanHeld
             maps = self._maps()
             seen = set()
@@ -1497,7 +1535,7 @@ class AppleCalendarSync:
                     counts["status"]="partial";continue
                 if mapping["calendar_id"] not in successful or mapping["alcor_id"] in seen or mapping["alcor_id"] in blocked_ids:
                     continue
-                if mapping["state"] in ("deleted", "remote_deleted", "locally_deleted", "conflict", "instance_excluded", "pending_delete"):
+                if mapping["state"] in ("deleted", "remote_deleted", "locally_deleted", "conflict", "instance_excluded", "pending_delete", "legacy_kept"):
                     continue
                 try:
                     from apple_sync.group_scan_claims import ScanHeld
@@ -1606,6 +1644,7 @@ class AppleCalendarSync:
         except Exception as exc:
             failures.append(report_sync_error("calendar", "同步日历", exc))
             counts["status"] = "error"
+            counts['error'] = failures[-1]
 
         counts['blocked_local_ids'] = sorted(blocked_ids) if 'blocked_ids' in locals() else []
         return counts, not failures

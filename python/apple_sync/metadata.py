@@ -4,7 +4,7 @@ import json
 from apple_sync.timezones import normalize_timezone
 
 
-def conflict_summaries(mappings, get_record, identity, local_restore_pending=(), bound_conflict_pending=None):
+def conflict_summaries(mappings, get_record, identity, local_restore_pending=(), bound_conflict_pending=None, get_observation=None):
     result = []
     for row in mappings:
         restoring = row[identity] in local_restore_pending
@@ -17,9 +17,13 @@ def conflict_summaries(mappings, get_record, identity, local_restore_pending=(),
         except KeyError:
             local = {}
             local_missing = True
+        evidence = (get_observation(row[identity]) or {}) if get_observation and not restoring and not resolving else {}
+        observation = evidence.get('remote') or {}
+        source_check = evidence.get('reason') == row.get('conflict') and bool(observation.get('absence_evidence') or observation.get('absence'))
         result.append({identity:row[identity], 'reason':row.get('conflict') or ('请核对该项目上次选择的保存回执，不会重复提交' if resolving else '请核对本地恢复回执，Apple 内容未改动'),
                        'title':local.get('title'), 'category_id':local.get('category_id'),
                        'local_missing':local_missing, 'local_restore_pending':restoring,
+                       **({'source_check': True} if source_check else {}),
                        **({'bound_conflict_pending':resolving} if resolving else {})})
     return result
 

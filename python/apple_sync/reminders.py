@@ -17,7 +17,7 @@ from apple_sync.contracts import bind_item,process_operations,native_delete_prev
 from apple_sync.categories import synchronize_categories, synchronize_moves, reconcile_category_names, resolve_category_conflict, prime_bindings, verify_category_source
 from apple_sync.category_links import bidirectional_links, validate_links
 from apple_sync.bridge import AppleCalendarBridge
-from apple_sync.runtime import report_sync_error
+from apple_sync.runtime import SourceRetries, record_sync_result, report_sync_error
 
 
 def _instant(value):
@@ -102,6 +102,7 @@ class AppleReminderSync:
         self.clock = clock or (lambda: datetime.now(timezone.utc).isoformat())
         self._lock = threading.RLock()
         self._auto_started = False
+        self._source_retries = SourceRetries()
         with self._connect() as db:
             # A legacy or mixed schema must only be changed by the supervised cold migration.
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -312,8 +313,10 @@ class AppleReminderSync:
         return {**native, "watch_degraded": bool(self._get('connected', False) and self._get('auto_enabled', True) and native.get('watch_control_version') != 1 and not direct_watch), "connected": bool(self._get("connected", False)),
                 "auto_enabled": bool(self._get("auto_enabled", True)), "sync_all": bool(self._get("sync_all", False)),
                 "scan_claims": scan_status(self), "category_creates":creates, "retained_categories":retained_status(self), "marker_conflicts":marker_status(self), "identity_candidates":identity_candidates, "list_ids": self._get("list_ids", []), "direction": self._get("direction", "bidirectional"),
-                "lists": lists, "categories": categories, "last_success": self._get("last_success"), "error": listing_error or self._get("error", ""),
-                "conflicts": conflict_summaries(maps, self.todos.get_todo, 'todo_id', restore_pending(self), conflict_pending(self)),
+                "lists": lists, "categories": categories, "last_success": self._get("last_success"),
+                "error": listing_error or self._get("error", ""), "listing_error": listing_error, "sync_result": self._get('sync_result'),
+                "conflicts": conflict_summaries(maps, self.todos.get_todo, 'todo_id', restore_pending(self), conflict_pending(self),
+                                                lambda identity: self._get('reminder-inbound-conflict:'+identity)),
                 "legacy_deletions": [dict(todo_id=row['todo_id'], reason='旧版删除尚未核对，Apple 提醒事项及关联已保留。') for row in maps if row['state']=='pending_delete'],
                 "pending_deletions": sum(row["state"] == "pending_delete" for row in maps),
                 "pending_local_deletions": sum(row["state"] == "pending_local_delete" for row in maps),
@@ -340,7 +343,7 @@ class AppleReminderSync:
                 self._set('connected', True)
                 self._set('auto_enabled', True)
                 self.resume_auto()
-                self._set('error', '')
+                record_sync_result(self, {'status': 'success'})
                 return {'state': self.status(), 'result': {'status': 'success', 'deleted_lists': deleted_categories}}
             if sync_all and not state['lists']:
                 raise ValueError('没有可同步的来源，请检查系统账户或授权后重试')
@@ -706,12 +709,14 @@ class AppleReminderSync:
         self._set('retired_reminder_ids',list(dict.fromkeys(retired)))
         return [row for row in rows if row['reminder_id'] not in retired and (row.get('list_id'),row.get('reminder_id')) not in held_candidates]
 
-    def _process_remote(self, remote, mapping, direction, counts, category_id=None):
+    def _process_remote(self, remote, mapping, direction, counts, category_id=None, *, scan_token=None):
         from apple_sync.category_rebuild import retained_ids
         if mapping['todo_id'] in retained_ids(self):
             counts['conflicts']+=1
             return
         from apple_sync.metadata import metadata
+        if mapping.get('state') == 'legacy_kept':
+            return
         if mapping.get('state')=='conflict':
             counts['conflicts']+=1
             return
@@ -759,6 +764,9 @@ class AppleReminderSync:
         remote_changed=_hash(remote,remote=True)!=mapping['remote_hash'] or remote_extra
         reason=None
         if local_changed and remote_changed:
+            from apple_sync.sync_merge import merge_bound_item
+            if merge_bound_item(self, 'reminders', mapping, expected, remote, baselines, direction, scan_token, counts):
+                return
             reason='Both Alcor and Apple changed this reminder'
         elif remote_changed and direction not in ('import','bidirectional'):
             reason='Apple changed an export-only reminder'
@@ -939,7 +947,7 @@ class AppleReminderSync:
                         counts["exported"] += 1
             return counts
 
-    def sync(self, manual=False, confirm_deletions=False, confirm_local_deletions=False):
+    def sync(self, manual=False, confirm_deletions=False, confirm_local_deletions=False, *, background=False):
         with self._lock:
             failures = []
             counts = {"status": "success", "imported": 0, "updated": 0, "exported": 0,
@@ -951,6 +959,8 @@ class AppleReminderSync:
             if self.bridge.call("reminder_status").get("authorization") != "full_access":
                 counts["status"] = "permission_required"
                 return counts
+            from apple_sync.sync_recovery import recover_receipts
+            recover_receipts(self, 'reminders')
             automatic_deletions = self._get("sync_deletions", False)
             confirm_deletions = confirm_deletions or automatic_deletions
             confirm_local_deletions = confirm_local_deletions or automatic_deletions
@@ -959,7 +969,7 @@ class AppleReminderSync:
                     counts['deleted_categories'] = synchronize_categories(self, self.todos, 'reminders')
                 except Exception as exc:
                     counts['status'] = 'error'
-                    self._set('error', report_sync_error('reminders', '同步分类', exc))
+                    record_sync_result(self, counts, report_sync_error('reminders', '同步分类', exc))
                     return counts
             if not self._get('sync_all',False):
                 _,errors = process_operations(self,self.todos,'reminders')
@@ -970,7 +980,7 @@ class AppleReminderSync:
                 counts['exported'] += synchronize_moves(self, self.todos, 'reminders', lambda row, mapping, remote: _hash(row, remote=remote))
             except Exception as exc:
                 counts['status'] = 'error'
-                self._set('error', report_sync_error('reminders', '同步分类移动', exc))
+                record_sync_result(self, counts, report_sync_error('reminders', '同步分类移动', exc))
                 return counts
             stored_links = self._stored_links()
             using_links = bool(stored_links)
@@ -980,6 +990,7 @@ class AppleReminderSync:
             if any(row['enabled'] and row['alcor_id'] not in existing_categories for row in stored_links):
                 counts['status'] = 'partial'
             selected = [row["apple_id"] for row in enabled_links] if using_links else self._get("list_ids", [])
+            waiting = {key for key in selected if background and self._source_retries.waiting(key)}
             direction = self._get("direction", "bidirectional")
             from apple_sync import group_scan_claims as claims
             try:
@@ -989,7 +1000,7 @@ class AppleReminderSync:
                     raise ValueError('reminder list inventory is ambiguous')
             except Exception as exc:
                 counts['status']='error'
-                self._set('error',report_sync_error('reminder','读取同步来源',exc))
+                record_sync_result(self, counts, report_sync_error('reminder','读取同步来源',exc))
                 return counts
             # This is the first item inventory used by inbound-move/absence logic.
             # Capture before it, so later missing markers never absorb intervening edits.
@@ -1006,6 +1017,8 @@ class AppleReminderSync:
                 try:
                     verified_links=[]
                     for link in enabled_links:
+                        if link['apple_id'] in waiting:
+                            continue
                         try:
                             verify_category_source(self.todos.get_category(link['alcor_id']),link,groups.get(link['apple_id'],{}))
                         except claims.ScanUnavailable:
@@ -1019,8 +1032,13 @@ class AppleReminderSync:
                 except Exception as exc:
                     counts['status']='error'
                     failures.append(report_sync_error('reminder','读取跨分类位置',exc))
-            held=[]
+            held, completed = [], []
             for group_id in dict.fromkeys(selected):
+                if group_id in waiting:
+                    counts['failed_list_ids'].append(group_id)
+                    if counts['status'] != 'error':
+                        counts['status'] = 'partial'
+                    continue
                 token=None
                 source_id=None
                 item_phase_started=False
@@ -1034,33 +1052,50 @@ class AppleReminderSync:
                     link=next((row for row in enabled_links if row['apple_id']==group_id),None)
                     if link:
                         verify_category_source(self.todos.get_category(link['alcor_id']),link,target)
-                    token=claims.acquire(self,source_id,group_id,{'kind':'reminder_scan'})
-                    current=self.bridge.call('reminder_lists')
+                    token=claims.acquire(self,source_id,group_id,{'kind':'reminder_scan'},reading=True)
+                    try:
+                        current=self.bridge.call('reminder_lists')
+                    except Exception as exc:
+                        raise claims.ScanUnavailable(report_sync_error('reminder', '检查提醒来源', exc)) from exc
                     found=[row for row in current.get('lists',[]) if row.get('id')==group_id]
                     if found != [target] or source_id not in current.get('source_ids',[]):
                         raise claims.ScanUnavailable('reminder list changed before scan')
                     if link:
                         verify_category_source(self.todos.get_category(link['alcor_id']),link,found[0])
+                    claims.begin_item_phase(self, token)
                     item_phase_started=True
                     result,safe=self._sync_claimed_reminder_list(group_id,source_id,token,direction,using_links,enabled_links,
                                                                automatic_deletions,manual,confirm_local_deletions,missing_captures,deferred_inbound_moves)
                     for key,value in result.items():
-                        if key in ('status','failed_list_ids'):
+                        if key in ('status','failed_list_ids','error'):
                             continue
                         counts[key]+=value
                     counts['failed_list_ids']+=result['failed_list_ids']
+                    if result.get('error'):
+                        failures.append(result['error'])
                     if result['status']!='success':
                         counts['status']='error' if result['status']=='error' else 'partial'
                     if safe:
                         # Finish only a fully returned per-list execution, with the same manager snapshots.
                         self._complete_reminder_scan(token,group_id)
+                        if not result['failed_list_ids']:
+                            self._source_retries.clear(group_id)
+                            completed.append(group_id)
+                        else:
+                            self._source_retries.defer(group_id)
                     else:
+                        self._source_retries.clear(group_id)
                         claims.uncertain(self,token)
+                        counts['failed_list_ids'].append(group_id)
                         held.append(group_id)
                 except Exception as exc:
-                    if isinstance(exc,claims.ScanUnavailable):
+                    if not isinstance(exc, claims.ScanHeld):
                         counts['failed_list_ids'].append(group_id)
                     retain,verification_error=self._failed_reminder_scan(token,source_id,group_id,item_phase_started,exc)
+                    if not retain and not verification_error and isinstance(exc, claims.ScanUnavailable):
+                        self._source_retries.defer(group_id)
+                    else:
+                        self._source_retries.clear(group_id)
                     if retain:
                         held.append(group_id)
                     partial=isinstance(exc,(claims.ScanHeld,claims.ScanUnavailable)) and verification_error is None
@@ -1070,15 +1105,16 @@ class AppleReminderSync:
                     if verification_error:
                         failures.append(verification_error)
             counts['scan_claims']=claims.status(self)
+            counts['checked_group_ids']=completed
+            self._source_retries.record(counts, selected)
             if held:
                 counts['held_list_ids']=sorted(set(held))
             if name_errors and counts['status']=='success':
                 counts['status']='error'
             if counts['status']=='success':
                 self._set('last_success',self.clock())
-                self._set('error','')
-            else:
-                self._set('error',failures[0] if failures else name_errors[0] if name_errors else '部分提醒事项待核对；其他清单继续同步')
+            message = next(iter(failures or name_errors), '部分提醒事项待核对或暂时无法读取')
+            record_sync_result(self, counts, '' if counts['status'] == 'success' else message)
             return counts
 
     def _failed_reminder_scan(self, token, source_id, group_id, item_phase_started, reason):
@@ -1117,6 +1153,7 @@ class AppleReminderSync:
                                     automatic_deletions, manual, confirm_local_deletions, missing_captures, deferred_inbound_moves):
         from apple_sync.group_scan_claims import claim_items, ScanHeld
         from apple_sync.marker_recovery import MarkerRecoveryError
+        from apple_sync.sync_merge import MergeInterrupted
         selected = [group_id]
         failures, name_errors = [], []
         counts = {"status":"success","imported":0,"updated":0,"exported":0,"deleted_local":0,
@@ -1129,7 +1166,7 @@ class AppleReminderSync:
                 # No owner or native write has begun. The exact scan claim can finish.
                 counts['status']='error'
                 counts['failed_list_ids']=selected
-                self._set('error',report_sync_error('reminder','读取提醒库存',exc))
+                counts['error']=report_sync_error('reminder','读取提醒库存',exc)
                 return counts, True
             successful = set(inventory["successful_list_ids"]) & set(selected)
             if any(row.get('list_id') != group_id or row.get('source_id') != source_id for row in inventory['reminders']):
@@ -1180,7 +1217,8 @@ class AppleReminderSync:
                         if mapping['list_id'] != group_id:
                             raise ScanHeld('reminder moved across containers; joint identity review required')
                         claim_items(self,token,[mapping['todo_id']])
-                        self._process_remote(remote, mapping, item_direction, counts, category_id)
+                        self._process_remote(remote, mapping, item_direction, counts, category_id,
+                                             scan_token=token if not failures and not counts['conflicts'] else None)
                     elif self._recover_marked(remote, maps, counts,scan_token=token,scan_safe=not failures):
                         if remote.get("alcor_id"):
                             seen.add(remote["alcor_id"])
@@ -1194,7 +1232,7 @@ class AppleReminderSync:
                         maps.append(mapping)
                         seen.add(local["id"])
                         counts["imported"] += 1
-                except MarkerRecoveryError:
+                except (MarkerRecoveryError, MergeInterrupted):
                     raise
                 except ScanHeld as exc:
                     failures.append(str(exc))
@@ -1204,7 +1242,7 @@ class AppleReminderSync:
                     counts["status"] = "error"
             for mapping in self._maps():
                 if (mapping['list_id'] not in successful or mapping['todo_id'] in seen or
-                        mapping['state'] in ('deleted','remote_deleted','conflict','pending_delete')):
+                        mapping['state'] in ('deleted','remote_deleted','conflict','pending_delete','legacy_kept')):
                     continue
                 if mapping['todo_id'] in deferred_inbound_moves:
                     counts['status']='partial'
@@ -1262,7 +1300,7 @@ class AppleReminderSync:
         except Exception as exc:
             failures.append(report_sync_error("reminder", "同步提醒事项", exc))
             counts["status"] = "error"
-            self._set("error", failures[-1])
+            counts['error'] = failures[-1]
         return counts, counts['status'] != 'error'
 
 
@@ -1634,7 +1672,7 @@ class AppleReminderSync:
         with self._lock:
             if stop_event.is_set() or not self._get('auto_enabled', True) or not self._get('connected', False):
                 return None
-            return self.sync()
+            return self.sync(background=True)
 
     def stop_auto(self):
         if self._auto_started:
