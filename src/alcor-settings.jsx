@@ -74,14 +74,26 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
     } catch (failure) { if (mounted.current) setRebuildError(failure.message) }
     finally { if (mounted.current) setRebuilding(false) }
   }
+  async function resumeVerifiedScan() {
+    setRebuilding(true); setRebuildError('')
+    try {
+      const result = await api.reviewSync({ kind, action:'resume_verified_scan', identity:item.attempt_id, revision:checked.revision })
+      if (!result.ok) throw new Error(result.error?.message ?? '暂时无法恢复同步，请重新核对。')
+      if (mounted.current) setChecked(result.value)
+    } catch (failure) {
+      if (mounted.current) { setChecked(null); setRebuildError(failure.message) }
+    } finally { if (mounted.current) setRebuilding(false) }
+  }
   return <Modal open title={title} headless className="apple-sync-review" onClose={() => { if (!busy) close() }}>
     <header className="apple-sync-review-header"><h2>{title}</h2><Button variant="ghost" size="sm" aria-label="关闭处理窗口" disabled={busy} onClick={close}><IconCloseOutlineRegular size={18} /></Button></header>
     <div className="apple-sync-review-body">
       <div className="apple-sync-subject"><span className="apple-sync-eyebrow">{item.label}</span><h3>{item.title}</h3>{item.source && <p>{item.source}</p>}{localRestore && <p>Alcor ID：{item.alcor_id ?? item.todo_id}</p>}</div>
       {rebuildPlan ? <Notice tone="warning" className="apple-sync-notice"><strong>在 {rebuildPlan.source.title || rebuildPlan.source.name || rebuildPlan.source_id} 创建空{groupLabel}「{rebuildPlan.title}」</strong><p>只创建容器，不上传原成员。以下 {rebuildPlan.retained_members.length} 项及旧关联证据保留在本地，等待重新关联。</p><ul>{rebuildPlan.retained_members.map(member => <li key={member.id}>{member.title}</li>)}</ul></Notice> : confirm ? <Notice tone="warning" className="apple-sync-danger-note"><strong>将删除此{groupLabel}及其中全部{kind === 'calendar' ? '日程' : '事务'}。</strong><p>只有确认 Apple 中的来源已被删除时，才选择此操作。Alcor 中的删除无法撤销。</p></Notice> : <>
         {item.type === 'scan_claim' ? <>
-          <Notice tone="warning" className="apple-sync-notice">{item.state === 'uncertain' ? `上次操作结果待核对，此${groupLabel}暂停更新。可继续同步其他来源。` : `此${groupLabel}仍有同步操作在处理，请稍后查看。`}</Notice>
-          {checked && <p role="status">{checked.status === 'receipt_finished' ? '已根据原回执完成本地收尾。'
+          {checked?.status !== 'baseline_restored' && <Notice tone="warning" className="apple-sync-notice">{item.state === 'uncertain' ? `上次操作结果待核对，此${groupLabel}暂停更新。可继续同步其他来源。` : `此${groupLabel}仍有同步操作在处理，请稍后查看。`}</Notice>}
+          {checked && <p role="status">{checked.status === 'baseline_restored' ? '已解除旧同步占用。后续同步会沿用核实过的关联。'
+            : checked.status === 'verified' ? `已完整核对 ${checked.checked} 项，当前内容和关联一致。可以恢复此日历的同步。`
+            : checked.status === 'receipt_finished' ? '已根据原回执完成本地收尾。'
             : checked.status === 'released' ? '确认上次只读取了来源，已解除占用。'
             : checked.status === 'gone' ? '该操作已结束，请刷新同步状态。' : checked.status === 'source_unavailable'
             ? '暂时无法完整读取原来源，请检查 Apple 账户和权限。'
@@ -132,7 +144,8 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
       {error && <Notice tone="error" role="alert" className="apple-sync-error">{error}</Notice>}
     </div>
     <footer className="apple-sync-review-footer">{!detailsOnly && <span>{rebuildPlan ? '仅创建空容器，不上传原成员' : confirm ? '此操作无法撤销' : '确认前不会更改内容'}</span>}<div><Button ref={backButton} variant="outline" disabled={busy} onClick={() => { if (rebuildPlan) { rebuildPage.current.invalidate(); setRebuildPlan(null) } else if (confirm) setConfirm(false); else close() }}>{confirm || rebuildPlan ? '返回' : detailsOnly ? '关闭' : '暂不处理'}</Button>
-      {review && <Button variant={checked && review !== 'check_scan' ? 'ghost' : 'primary'} disabled={busy} onClick={() => void inspect()}>{review === 'compare_record' ? '比较差异' : review === 'compare_identity' ? '比较候选' : '重新核对'}</Button>}
+      {review && checked?.status !== 'baseline_restored' && <Button variant={checked && (review !== 'check_scan' || checked.status === 'verified') ? 'outline' : 'primary'} disabled={busy} onClick={() => void inspect()}>{review === 'compare_record' ? '比较差异' : review === 'compare_identity' ? '比较候选' : '重新核对'}</Button>}
+      {checked?.status === 'verified' && <Button variant="primary" disabled={busy} onClick={() => void resumeVerifiedScan()}>恢复同步</Button>}
       {legacy && checked?.revision && <>
         {checked.can_restore && <Button variant="outline" disabled={busy} onClick={() => resolve('restore_legacy', null, checked.revision)}>恢复到 Alcor</Button>}
         <Button variant="primary" disabled={busy} onClick={() => resolve('keep_legacy', null, checked.revision)}>{kind === 'reminders' ? '保留提醒' : '保留日程'}</Button>

@@ -29,8 +29,71 @@ def _lookup(sync, kind, row):
     return sync.bridge.call('reminder_lookup' if reminder else 'lookup', **{key:row[key] for key in keys}).get(singular)
 
 
-def check_scan(sync, kind, attempt_id):
+def _legacy_scan_rows(db, attempt):
+    group, token, source = attempt['group_id'], attempt['attempt_id'], attempt['source_id']
+    current = db.execute(
+        'SELECT a.* FROM calendar_scan_groups g JOIN calendar_scan_attempts a USING(attempt_id) '
+        'WHERE g.group_id=? AND g.attempt_id=? AND g.source_id=?', (group, token, source)).fetchone()
+    if not current or dict(current) != dict(attempt):
+        return None
+    from apple_sync.export_reservations import schema
+    if schema(db):
+        for table in ('trusted_export_reservations', 'ordinary_export_claims'):
+            if db.execute(f'SELECT 1 FROM {table} WHERE group_id=? OR local_id IN '
+                          '(SELECT local_id FROM calendar_scan_items WHERE attempt_id=?)', (group, token)).fetchone():
+                return None
+    link = db.execute('SELECT * FROM category_links WHERE apple_id=? AND enabled=1', (group,)).fetchone()
+    if not link:
+        return None
+    held = [row[0] for row in db.execute('SELECT local_id FROM calendar_scan_items WHERE attempt_id=? ORDER BY local_id', (token,))]
+    mapped = []
+    for row in db.execute("SELECT m.*,s.value AS baseline FROM mappings m LEFT JOIN settings s ON s.key='item-metadata:'||m.alcor_id "
+                          "WHERE m.calendar_id=? ORDER BY m.id", (group,)):
+        mapping = dict(row)
+        baseline = mapping.pop('baseline')
+        mapped.append((mapping, json.loads(baseline) if baseline else None))
+    return dict(link), held, mapped
+
+
+def _legacy_scan_proof(sync, attempt, target, window, rows, locals_by_id, native_by_id):
+    from apple_sync.calendar_rebind import _instant
+    from apple_sync.metadata import metadata
+    if not rows or not rows[1]:
+        return None
+    link, held, mapped = rows
+    verify_category_source(sync.calendar.get_category(link['alcor_id']), link, target)
+    lower, upper = map(_instant, window)
+    live_ids, checked = set(), {}
+    for mapping, baseline in mapped:
+        identity = mapping['alcor_id']
+        local = locals_by_id.get(identity)
+        native = [item for item in native_by_id.get(mapping['event_id'], ())
+                  if _same_native_item('calendar', mapping, item) and item.get('external_id') == mapping['external_id']]
+        if not native and not lower <= _instant(mapping['occurrence_date']) < upper and identity not in held:
+            continue
+        if mapping['state'] == 'remote_deleted' and not native and not local and identity not in held:
+            continue  # Preserve established tombstones.
+        if mapping['state'] != 'active' or mapping['missing_since'] or not local or len(native) != 1 or id(native[0]) in live_ids:
+            return None
+        apple = native[0]
+        binding = local.get('apple') or {}
+        if (local.get('category_id') != link['alcor_id'] or binding.get('group_id') != attempt['group_id']
+                or binding.get('apple_id') != mapping['event_id'] or binding.get('source_id') != attempt['source_id']
+                or _hashes('calendar', local, apple, mapping) != (mapping['local_hash'], mapping['remote_hash'])
+                or baseline != [metadata(local), metadata(apple, True)]):
+            return None
+        checked[identity] = [local, apple]
+        live_ids.add(id(apple))
+    if (len(live_ids) != sum(map(len, native_by_id.values())) or not set(held) <= checked.keys()
+            or any(op['local_id'] in checked or op['local_id'] == link['alcor_id']
+                   or (op.get('binding') or {}).get('group_id') == attempt['group_id'] for op in sync.calendar.apple_operations())):
+        return None
+    return claims.digest([dict(attempt), target, rows, checked])
+
+
+def check_scan(sync, kind, attempt_id, revision=None):
     with sync._connect() as db:
+        db.execute('BEGIN')
         if not claims.schema(db):
             return {'status': 'gone'}
         attempt = db.execute(
@@ -40,11 +103,15 @@ def check_scan(sync, kind, attempt_id):
         if not attempt:
             return {'status': 'gone'}
         held = db.execute('SELECT count(*) FROM calendar_scan_items WHERE attempt_id=?', (attempt_id,)).fetchone()[0]
+        legacy = kind == 'calendar' and attempt['state'] == 'uncertain' and json.loads(attempt['evidence']) == {}
+        rows = _legacy_scan_rows(db, attempt) if legacy else None
+    if revision is not None and not rows:
+        raise ValueError('旧同步范围已变化，请重新核对')
     reminder = kind == 'reminders'
     window = json.loads(attempt['window'])
     evidence = json.loads(attempt['evidence'])
     try:
-        _source(sync, kind, attempt['group_id'], attempt['source_id'])
+        target = _source(sync, kind, attempt['group_id'], attempt['source_id'])
         if evidence.get('stage') in ('merge_sending', 'merge_rechecking'):
             from apple_sync.sync_merge import finish_merge_receipt
             if finish_merge_receipt(sync, kind, attempt_id, evidence):
@@ -109,8 +176,24 @@ def check_scan(sync, kind, attempt_id):
             local = locals_by_id.get(row[local_key])
             if local and _hashes(kind, local, native[0], row) == (row['local_hash'], row['remote_hash']):
                 unchanged += 1
-    # Matching current versions alone cannot prove an old operation was never sent.
-    return {'status': 'needs_evidence', 'held': held, 'checked': len(inventory[rows_key]), 'matched': matched, 'unchanged': unchanged}
+    result = {'status': 'needs_evidence', 'held': held, 'checked': len(inventory[rows_key]), 'matched': matched, 'unchanged': unchanged}
+    proof = _legacy_scan_proof(sync, attempt, target, window, rows, locals_by_id, native_by_id) if legacy else None
+    if revision is None:
+        return {**result, 'status': 'verified', 'revision': proof} if proof else result
+    if not proof or revision != proof:
+        raise ValueError('内容、关联或范围已变化，请重新核对')
+    # Close the obsolete claim, preserving the observed baseline and original attempt.
+    with sync._connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        claims.schema(db)
+        if _legacy_scan_rows(db, attempt) != rows:
+            raise ValueError('同步占用或范围已变化，请重新核对')
+        audit = {'stage':'verified_baseline', 'previous_state':'uncertain', 'revision':proof,
+                 'checked':result['checked'], 'held':held, 'completed_at':sync.clock()}
+        db.execute("UPDATE calendar_scan_attempts SET state='done', evidence=? WHERE attempt_id=?", (json.dumps(audit), attempt_id))
+        db.execute('DELETE FROM calendar_scan_items WHERE attempt_id=?', (attempt_id,))
+        db.execute('DELETE FROM calendar_scan_groups WHERE attempt_id=?', (attempt_id,))
+    return {**result, 'status': 'baseline_restored'}
 
 
 def recover_receipts(sync, kind):
