@@ -12,7 +12,7 @@ export function connectionStatus(state, busy, readFailed = false) {
       (state.error === 'Apple container is held by another unfinished operation' && state.scan_claims?.length) ||
       (!state.sync_result && state.error?.startsWith('部分') && !state.listing_error)) return { label: '部分同步 · 待处理', tone: 'warning' }
   if (state.error) return { label: '同步异常', tone: 'error' }
-  if (state.marker_conflicts?.length || state.category_conflicts?.length || state.operations?.length || state.scan_claims?.length || state.category_creates?.length || state.retained_categories?.length || state.identity_candidates?.length || state.legacy_deletions?.length || state.links?.some(link => link.name_conflict)) return { label: '部分同步 · 待处理', tone: 'warning' }
+  if (state.marker_conflicts?.length || state.category_conflicts?.length || state.operations?.length || state.scan_claims?.some(row => !row.background_check || row.state === 'uncertain') || state.category_creates?.length || state.retained_categories?.length || state.identity_candidates?.length || state.legacy_deletions?.length || state.links?.some(link => link.name_conflict)) return { label: '部分同步 · 待处理', tone: 'warning' }
   if (state.conflicts?.length) return { label: '待处理冲突', tone: 'warning' }
   if (state.readonly_issues?.length) return { label: '部分同步 · 含只读内容', tone: 'warning' }
   if (state.connected && state.auto_enabled) return { label: '自动同步已开启', tone: 'success' }
@@ -62,7 +62,9 @@ export function reviewItems(state, kind) {
     ...(state?.retained_categories ?? []).map(item => ({ ...item, type:'category_retained', key:`retained:${item.old_group}`, label:`空容器已创建 · ${item.member_count} 项成员保留本地`, source:item.source_id || '' })),
     ...(state?.category_creates ?? []).map(item => ({ ...item, type: 'category_create', key: `create:${item.local_id}`, title: item.title || `${groupLabel}创建待核对`, label: ['owner_claiming','owner_committed'].includes(item.state) ? '本地分类提交待核对' : item.state === 'waiting' ? '分类创建等待重试' : '分类创建结果待核对', source: item.source_id || '' })),
     ...(state?.identity_candidates ?? []).map(item => ({ ...item, identity: item.key, type: 'identity_candidate', key: `identity:${item.key}`, title: item.native?.title || `${groupLabel}项目身份待核对`, label: '可能是同一项目', source: syncSource(state, item.native?.calendar_id ?? item.native?.list_id).source })),
-    ...Array.from(scans, ([group, claims]) => {
+    ...Array.from(scans).flatMap(([group, rows]) => {
+      const claims = rows.filter(row => !row.background_check)
+      if (!claims.length) return []
       const item = claims.find(row => row.state === 'uncertain') ?? claims[0]
       const { title, source } = syncSource(state, item.group_id)
       return { ...item, claims, type: 'scan_claim', key: `claim:${group}`, title: title || `Apple ${groupLabel}`, source,

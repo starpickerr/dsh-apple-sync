@@ -204,6 +204,11 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def unstarted_category_check(evidence):
+    return (evidence.get('kind') == 'manager_work' and evidence.get('stage') == 'claimed'
+            and isinstance(evidence.get('evidence'), dict) and evidence['evidence'].get('kind') == 'category_properties')
+
+
 def status(sync):
     with sync._connect() as db:
         if not schema(db):
@@ -215,6 +220,8 @@ def status(sync):
             evidence=json.loads(row['evidence'])
             rows.append({key:row[key] for key in ('attempt_id','source_id','group_id','state','window','started_at')})
             rows[-1].update(stage=evidence.get('stage'),reason=evidence.get('reason',''))
+            if unstarted_category_check(evidence):
+                rows[-1]['background_check'] = True
         return rows
 
 
