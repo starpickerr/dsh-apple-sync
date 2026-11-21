@@ -49,9 +49,7 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
   const compare = review === 'compare_record'
   const detailsOnly = retained || categoryWaiting || item.source_check
   const single = item.type === 'operation' || item.kind === 'legacy_retained'
-  const diagnostic = item.type === 'scan_claim' ? item.claims.map(claim =>
-    [formatSyncTime(claim.started_at), claim.stage || claim.state, claim.group_id, claim.reason].filter(Boolean).join(' · ')
-  ) : !item.source_check && !['category_create', 'category_retained'].includes(item.type) && (item.reason || item.error)
+  const diagnostic = !item.source_check && !['scan_claim', 'category_create', 'category_retained'].includes(item.type) && (item.reason || item.error)
   const actionable = !detailsOnly && !uncertain && (!compare || !!checked) && (single || item.type === 'record' || ['name', 'color', 'missing_source'].includes(item.kind))
   const title = rebuildPlan ? `确认创建空 Apple ${groupLabel}？` : detailsOnly ? '同步详情' : confirm ? `删除 Alcor ${groupLabel}？` : uncertain ? item.state === 'sending' ? '正在向 Apple 提交' : '请核对 Apple 操作结果' : item.type === 'operation' ? pendingDelete ? deletionPhaseLabel(item) : '等待同步' : '处理同步冲突'
   const apply = async () => {
@@ -94,10 +92,10 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
           {checked && <p role="status">{checked.status === 'baseline_restored' ? '已解除旧同步占用。后续同步会沿用核实过的关联。'
             : checked.status === 'verified' ? `已完整核对 ${checked.checked} 项，当前内容和关联一致。可以恢复此日历的同步。`
             : checked.status === 'receipt_finished' ? '已根据原回执完成本地收尾。'
-            : checked.status === 'released' ? '确认上次只读取了来源，已解除占用。'
+            : checked.status === 'released' ? '此来源可以继续同步。'
             : checked.status === 'gone' ? '该操作已结束，请刷新同步状态。' : checked.status === 'source_unavailable'
             ? '暂时无法完整读取原来源，请检查 Apple 账户和权限。'
-            : `${checked.checked == null ? '' : `本次从 Apple 读到 ${checked.checked} 项，核实 ${checked.matched} 条关联，其中 ${checked.unchanged} 条内容一致。`}缺少能确认原操作结果的记录，已保留同步占用。`}</p>}
+            : '暂时无法确认上次更改，已保留当前内容。'}</p>}
         </> : item.source_check ? <>
           <Notice tone="warning" className="apple-sync-notice">{item.reason}</Notice>
           {checked && <p role="status">{checked.status === 'present' ? `已在「${checked.source}」找到原项目。可重新同步以核对当前内容。` : `未在「${checked.source}」找到原项目。仍需核对是否被移动或删除，现有内容已保留。`}</p>}
@@ -238,7 +236,10 @@ function Connection({ kind, api }) {
   }
   const status = connectionStatus(state, busy, Boolean(readError))
   const items = reviewItems(state, kind)
-  const retrying = state?.authorization === 'full_access' ? state.sync_result?.retrying_group_ids ?? [] : []
+  const backgroundChecks = (state?.scan_claims ?? []).filter(row => row.background_check && row.state === 'uncertain')
+  const retrying = state?.authorization === 'full_access' ? [...new Set([
+    ...(state.sync_result?.retrying_group_ids ?? []), ...backgroundChecks.map(row => row.group_id),
+  ])] : []
   const retryingNames = retrying.map(id => syncSource(state, id).title).filter(Boolean)
   const failed = [...new Set(state?.sync_result?.failed_group_ids ?? [])].filter(id => !retrying.includes(id) && !items.some(item => item.group_id === id || item.apple_id === id))
   const failedNames = failed.map(id => syncSource(state, id).title).filter(Boolean)
@@ -249,7 +250,7 @@ function Connection({ kind, api }) {
   const readOnly = options.filter(source => !source.writable)
   const readOnlyIssues = state?.readonly_issues ?? []
   const coverage = kind === 'calendar' ? (state?.coverage ?? []).slice(-3).reverse() : []
-  const diagnostic = !syncError && !busy && state?.error && (!items.length || !!failed.length) ? state.error : ''
+  const diagnostic = !syncError && !busy && state?.error && ((!items.length && !backgroundChecks.length) || !!failed.length) ? state.error : ''
   const hasDetails = !!(readOnly.length || readOnlyIssues.length || coverage.length || diagnostic)
   const Icon = kind === 'calendar' ? IconClockOutlineRegular : IconChecklistOutlineRegular
   return <section className="apple-sync-connection" aria-label={title}>
@@ -260,7 +261,7 @@ function Connection({ kind, api }) {
     {syncError && !current && <Notice tone="error" className="apple-sync-notice" role="alert"><strong>{readError ? '暂时无法读取同步状态' : '同步未完成'}</strong><p>{syncError}</p></Notice>}
     {status.tone === 'warning' && !!(checked || failed.length || retrying.length) && <div className="apple-sync-metadata">
       {!!checked && <span>本次已检查 {checked} 个{kind === 'calendar' ? '日历' : '清单'}</span>}
-      {!!retrying.length && <span>{retryingNames.length === retrying.length ? retryingNames.join('、') : `${retrying.length} 个来源`}等待自动重试</span>}
+      {!!retrying.length && <span>{retryingNames.length === retrying.length ? retryingNames.join('、') : `${retrying.length} 个来源`}{active ? '稍后自动重试' : '将在下次同步时重试'}</span>}
       {!!failed.length && <span>{failedNames.length === failed.length ? failedNames.join('、') : `${failed.length} 个来源`}暂时无法更新</span>}
     </div>}
     {[true, false].map(decision => {
