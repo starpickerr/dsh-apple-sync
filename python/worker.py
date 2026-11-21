@@ -127,6 +127,8 @@ class AppleWorker:
         with manager._lock:
             if action == 'keep_legacy':
                 return sync_recovery.keep_legacy(manager, kind, identity, revision)
+            if action == 'resume_verified_scan' and kind == 'calendar' and revision:
+                return sync_recovery.check_scan(manager, kind, identity, revision)
             methods = {'check_scan': sync_recovery.check_scan, 'check_missing': sync_recovery.check_missing, 'preview_legacy': sync_recovery.preview_legacy,
                        'compare_record': sync_recovery.compare_record, 'compare_identity': sync_recovery.compare_identity}
             if action not in methods or revision is not None:

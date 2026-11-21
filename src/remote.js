@@ -9,6 +9,7 @@ export const boundConflictSchema = z.object({ ...syncIdentity, choice:z.enum(['k
 export const syncReviewSchema = z.discriminatedUnion('action', [
   z.object({ ...syncIdentity, action:z.enum(['check_scan','check_missing','preview_legacy','compare_record','compare_identity']) }).strict(),
   z.object({ ...syncIdentity, action:z.literal('keep_legacy'), revision }).strict(),
+  z.object({ kind:z.literal('calendar'), identity:syncIdentity.identity, action:z.literal('resume_verified_scan'), revision }).strict(),
 ])
 export const rebuildPreviewSchema = z.object({ kind:z.enum(['calendar','reminders']), apple_id:z.string().min(1).max(500), source_id:z.string().min(1).max(500) }).strict()
 export const rebuildCommitSchema = z.object({ ticket:z.string().uuid() }).strict()
