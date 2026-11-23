@@ -353,6 +353,11 @@ export default class AppleSync extends TypertRemoteService {
   @Remote
   cancelCategoryRebuild(request) { return this.rebuildPage.cancel(this.ctx.invocation, rebuildCommitSchema.parse(request)) }
 
+  dispatchReminderCompletion(localId: string, operationId: string) {
+    if (!this.active) return false
+    return this.worker.call('dispatch_reminder_completion', { local_id: localId, operation_id: operationId })
+  }
+
   @Remote
   invoke(request) {
     const input = requestSchema.parse(request), args = input.arguments
