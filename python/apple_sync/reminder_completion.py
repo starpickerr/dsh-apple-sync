@@ -4,6 +4,24 @@ from apple_sync.group_scan_claims import WorkClaim
 
 PREFIX='reminder-completion:'
 
+def dispatch(sync, local_id, operation_id):
+    """Process only this completion through the same claim and receipt path as auto-sync."""
+    with sync._lock:
+        if not sync._get('connected', False) or not sync._get('auto_enabled', True):
+            return False
+        service = sync.todos
+        operation = next((row for row in service.apple_operations()
+                          if row['id'] == operation_id and row['local_id'] == local_id
+                          and row['entity'] == 'item' and row['action'] == 'complete'
+                          and row['state'] == 'pending'), None)
+        if not operation or sync.bridge.call('reminder_status').get('authorization') != 'full_access':
+            return False
+        try:
+            return process(sync, service, operation)
+        except Exception as error:
+            service.apple_operation_error(operation_id, str(error))
+            raise
+
 
 def evidence(operation):
     return {key:operation[key] for key in ('id','entity','local_id','action','document','binding')}

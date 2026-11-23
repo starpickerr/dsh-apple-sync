@@ -103,6 +103,12 @@ class AppleWorker:
             raise ValueError('Unknown Apple operation')
         return getattr(manager, method)(**arguments)
 
+    def dispatch_reminder_completion(self, local_id, operation_id):
+        if self.verification_no_apple:
+            return False
+        from apple_sync.reminder_completion import dispatch
+        return dispatch(self.managers['reminders'], local_id, operation_id)
+
     def preview_category_rebuild(self,kind,apple_id,source_id):
         if self.verification_no_apple:
             raise RuntimeError('Apple sync is disabled for this verification process')
@@ -286,7 +292,7 @@ def main():
     def execute(request):
         try:
             action = request['action']
-            if action not in ('direct', 'initialize', 'invoke', 'review_sync', 'preview_category_rebuild', 'rebuild_category', 'prepare_approved_export', 'run_approved_export', 'prepare_approved_delete', 'run_approved_delete', 'prepare_item_restore', 'run_item_restore'):
+            if action not in ('direct', 'initialize', 'invoke', 'review_sync', 'preview_category_rebuild', 'rebuild_category', 'prepare_approved_export', 'run_approved_export', 'prepare_approved_delete', 'run_approved_delete', 'prepare_item_restore', 'run_item_restore', 'dispatch_reminder_completion'):
                 raise ValueError('Unknown Apple worker action')
             value = getattr(worker, action)(**request.get('input', {}))
             emit({'id': request['id'], 'ok': True, 'value': value})
