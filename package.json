@@ -1,6 +1,6 @@
 {
   "name": "@alcor/apple-sync",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Apple 日历与提醒事项：在 DSH 对话中查询和操作，可选连接 Alcor 同步。",
   "type": "module",
   "license": "MIT",
@@ -93,7 +93,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "python3 -B -m unittest discover -s tests",
+    "test": "python3 -B -m unittest discover -s tests && node --test tests/*.test.mjs",
     "prepack": "npm run build"
   },
   "devDependencies": {

@@ -182,8 +182,15 @@ function coverageLabel(period) {
   return [period.start, period.end].map(date => date.slice(0, 10).replaceAll('-', '/')).join(' – ')
 }
 
-function SyncDetails({ title, sources, issues, coverage, error, close }) {
+function SyncDetails({ title, sources, issues, coverage, activity, select, error, close }) {
   return <SettingsDialog title={`${title}同步明细`} close={close}>
+    {!!activity.length && <section className="apple-sync-detail-section">
+      <h3>同步进度</h3>
+      <ul className="apple-settings-list">{activity.map(item => <li key={item.key} className="apple-settings-list-row">
+        <div className="apple-settings-text"><strong>{item.title || item.label}</strong><small>{item.type === 'scan_claim' ? '等待更新' : item.label}</small></div>
+        {!item.background_check && <Button variant="outline" size="sm" onClick={() => select(item.key)}>查看</Button>}
+      </li>)}</ul>
+    </section>}
     {!!(sources.length || issues.length) && <section className="apple-sync-detail-section">
       <h3>只读来源</h3>
       <p className="apple-settings-caption">可导入 Alcor，更改在 Apple 中完成。</p>
@@ -262,6 +269,8 @@ function Connection({ kind, api }) {
   }
   const status = connectionStatus(state, busy, Boolean(readError))
   const items = reviewItems(state, kind)
+  const decisions = items.filter(needsDecision)
+  const activity = items.filter(item => !needsDecision(item))
   const backgroundChecks = (state?.scan_claims ?? []).filter(row => row.background_check && row.state === 'uncertain')
   const retrying = state?.authorization === 'full_access' ? [...new Set([
     ...(state.sync_result?.retrying_group_ids ?? []), ...backgroundChecks.map(row => row.group_id),
@@ -272,8 +281,7 @@ function Connection({ kind, api }) {
   const checked = state?.sync_result?.checked_group_ids?.length
   const syncError = message || readError || (status.tone === 'error' ? state?.error : '')
   const current = items.find(item => item.key === selected)
-  const blocker = current?.type === 'operation' && (items.find(item => item.type === 'scan_claim' && item.group_id && item.group_id === current.binding?.group_id)
-    || items.find(item => item.type === 'record' && item.todo_id && item.todo_id === current.local_id))
+  const blocker = current?.type === 'operation' && items.find(item => item.type === 'record' && item.todo_id && item.todo_id === current.local_id)
   const queued = current?.type === 'record' && items.find(item => item.type === 'operation' && item.entity === 'item' && item.local_id && item.local_id === current.todo_id)
   async function finishReview(text) {
     const started = ++revision.current
@@ -288,7 +296,7 @@ function Connection({ kind, api }) {
   const readOnlyIssues = state?.readonly_issues ?? []
   const coverage = kind === 'calendar' ? (state?.coverage ?? []).slice(-3).reverse() : []
   const diagnostic = !syncError && !busy && state?.error && ((!items.length && !backgroundChecks.length) || !!failed.length) ? state.error : ''
-  const hasDetails = !!(readOnly.length || readOnlyIssues.length || coverage.length || diagnostic)
+  const hasDetails = !!(readOnly.length || readOnlyIssues.length || coverage.length || activity.length || diagnostic)
   const Icon = kind === 'calendar' ? IconClockOutlineRegular : IconChecklistOutlineRegular
   return <section className="apple-sync-connection" aria-label={title}>
     <div className="apple-sync-heading"><div className="apple-sync-service"><span className="apple-sync-service-icon"><Icon size={22} /></span><div><h3>{title}</h3><span className="apple-sync-badge" data-tone={status.tone} role="status"><span className="apple-sync-dot" aria-hidden="true" />{syncStatusLabel(status, items, state)}</span></div></div><div className="apple-sync-actions"><Button variant="outline" size="sm" disabled={busy || !active} onClick={() => void run(async () => setState(await call('disconnect')))}>暂停同步</Button><Button variant="primary" size="sm" disabled={busy || !state?.supported} onClick={() => void run(sync)}>{busy ? '处理中…' : '同步'}</Button></div></div>
@@ -301,10 +309,12 @@ function Connection({ kind, api }) {
       {!!retrying.length && <span>{retryingNames.length === retrying.length ? retryingNames.join('、') : `${retrying.length} 个来源`}{active ? '稍后自动重试' : '将在下次同步时重试'}</span>}
       {!!failed.length && <span>{failedNames.length === failed.length ? failedNames.join('、') : `${failed.length} 个来源`}暂时无法更新</span>}
     </div>}
-    {[true, false].map(decision => {
-      const rows = items.filter(item => needsDecision(item) === decision)
-      return !!rows.length && <div key={String(decision)} className="apple-sync-inbox"><div className="apple-sync-inbox-heading"><h4>{decision ? '需要你确认' : '同步状态'} <span>{rows.length}</span></h4></div><div className="apple-sync-rows">{rows.map(item => <button type="button" key={item.key} className="apple-sync-row" disabled={busy} onClick={() => {setMessage(''); setSelected(item.key)}}><span className="apple-sync-row-icon" data-pending={item.type === 'operation'}>{item.type === 'operation' ? <IconClockOutlineRegular size={18} /> : <IconWarningOutlineRegular size={18} />}</span><span className="apple-sync-row-text"><strong>{item.title}</strong><span>{item.label}{item.source && ` · ${item.source}`}</span></span><span className="apple-sync-row-action">{decision ? '处理' : item.type === 'scan_claim' && reviewAction(item) ? '核对来源' : item.type === 'operation' && item.state === 'pending' ? '处理操作' : '查看'}<IconChevronRightOutlineRegular size={14} /></span></button>)}</div></div>
-    })}
+    {!!decisions.length && <div className="apple-sync-inbox"><div className="apple-sync-inbox-heading"><h4>需要你确认 <span>{decisions.length}</span></h4></div>
+      <div className="apple-sync-rows">{decisions.map(item => <button type="button" key={item.key} className="apple-sync-row" disabled={busy} onClick={() => {setMessage(''); setSelected(item.key)}}>
+        <span className="apple-sync-row-icon"><IconWarningOutlineRegular size={18} /></span><span className="apple-sync-row-text"><strong>{item.title}</strong><span>{item.label}{item.source && ` · ${item.source}`}</span></span>
+        <span className="apple-sync-row-action">处理<IconChevronRightOutlineRegular size={14} /></span>
+      </button>)}</div>
+    </div>}
     {hasDetails && <div className="apple-sync-facts">
       <dl>
         {!!(readOnly.length || readOnlyIssues.length) && <div><dt>只读来源</dt><dd>{readOnly.length} 个来源{readOnlyIssues.length ? ` · ${readOnlyIssues.length} 项保留` : ''}</dd></div>}
@@ -315,7 +325,7 @@ function Connection({ kind, api }) {
       </Button>
     </div>}
     {showDetails && <SyncDetails title={title} sources={readOnly} issues={readOnlyIssues} coverage={coverage}
-      error={diagnostic} close={() => setShowDetails(false)} />}
+      activity={activity} select={key => { setShowDetails(false); setSelected(key) }} error={diagnostic} close={() => setShowDetails(false)} />}
     {notice && <Notice className="apple-sync-success" role="status"><IconCheckOutlineRegular size={16} />{notice}</Notice>}
     {current && <Review key={current.key} item={current} kind={kind} state={state} api={api} blocker={blocker} queued={queued} select={setSelected}
       withdraw={async id => { ++revision.current; const fresh = await call('cancel_operation', { operation_id:id }); ++revision.current; setState(fresh); return fresh }} finishReview={finishReview} finishRebuild={value => { setState(value); setSelected(null); setNotice('空 Apple 容器已创建；原成员保留本地，尚未重新关联。') }} busy={busy} error={message} close={() => setSelected(null)} resolve={(choice, source, revision) => void run(async () => {const request = resolutionRequest(current,kind,choice,source)

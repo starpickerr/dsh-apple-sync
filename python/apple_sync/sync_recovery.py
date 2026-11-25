@@ -101,6 +101,7 @@ def _legacy_scan_proof(sync, attempt, target, window, rows, locals_by_id, native
 def _reminder_scan_proof(sync, attempt, target, rows, locals_by_id, native_by_id):
     """Close only a fully accounted-for scan. Divergent pairs go through conflict review."""
     from apple_sync.metadata import metadata
+    from apple_sync.reminders import same_completion
     link, held, mapped = rows
     group = attempt['group_id']
     verify_category_source(sync.todos.get_category(link['alcor_id']), link, target)
@@ -143,9 +144,13 @@ def _reminder_scan_proof(sync, attempt, target, rows, locals_by_id, native_by_id
             return None, [], f'「{title}」的本地关联与 Apple 来源不一致，请核对所属账户和清单。'
         seen.add(native_id)
         snapshots.append([local, native])
-        if row['state'] == 'active' and (row['missing_since'] or
-                _hashes('reminders', local, native, row) != (row['local_hash'], row['remote_hash'])
-                or baseline != [metadata(local), metadata(native, True)]):
+        hashes = _hashes('reminders', local, native, row)
+        previous = (row['local_hash'], row['remote_hash'])
+        metadata_changed = baseline != [metadata(local), metadata(native, True)]
+        if row['state'] == 'active' and (row['missing_since'] or metadata_changed or hashes != previous):
+            if (not row['missing_since'] and not metadata_changed and all(a != b for a, b in zip(hashes, previous))
+                    and same_completion(local, native)):
+                continue
             differences.append((identity, title))
     retired = set(sync._get('retired_reminder_ids', []))
     extra = set(native_by_id) - seen - retired
@@ -325,15 +330,23 @@ def recover_receipts(sync, kind):
     with sync._connect() as db:
         if not claims.schema(db):
             return
-        pending = [row[0] for row in db.execute(
-            "SELECT g.attempt_id FROM calendar_scan_groups g CROSS JOIN calendar_scan_attempts a USING(attempt_id) "
+        pending = db.execute(
+            "SELECT g.attempt_id, json_extract(a.evidence, '$.evidence.kind') AS operation "
+            "FROM calendar_scan_groups g CROSS JOIN calendar_scan_attempts a USING(attempt_id) "
             "WHERE json_extract(a.evidence, '$.stage') IN ('merge_sending','merge_rechecking') "
             "OR json_extract(a.evidence, '$.evidence.kind') IN ('manual_item_restore','bound_item_conflict') "
-            "OR (a.state='uncertain' AND json_extract(a.evidence, '$.stage')='claimed' "
-            "AND json_extract(a.evidence, '$.evidence.kind')='category_properties')")]
-    for attempt_id in pending:
+            "OR (operation='category_properties' AND json_extract(a.evidence,'$.stage')='claimed' "
+            "AND (a.state='uncertain' OR (a.state='scanning' AND julianday(a.started_at,'+2 minutes') <= julianday(?)))) "
+            "OR (a.state='uncertain' AND a.evidence='{}' AND "
+            "((?='reminders' AND json_extract(a.window,'$.kind')='reminder_scan') "
+            "OR (?='calendar' AND json_type(a.window)='array' AND json_array_length(a.window)=2)))",
+            (sync.clock(), kind, kind)).fetchall()
+    for attempt_id, operation in pending:
         try:
-            check_scan(sync, kind, attempt_id)
+            # Age only defers competition with a live reader. Release still requires exact pre-write evidence.
+            result = check_scan(sync, kind, attempt_id, restart_category=operation == 'category_properties')
+            if result['status'] == 'verified':
+                check_scan(sync, kind, attempt_id, revision=result['revision'])
         except Exception as exc:
             report_sync_error(kind, '核对同步回执', exc)
 

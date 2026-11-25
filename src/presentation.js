@@ -101,21 +101,20 @@ export function reviewAction(item) {
 
 export function syncStatusLabel(status, items, state) {
   if (status.label !== '部分同步 · 待处理') return status.label
-  const counts = []
-  const sources = items.filter(item => item.type === 'scan_claim').length
-  const pending = items.filter(item => item.type === 'operation' && item.state === 'pending').length
-  if (sources) counts.push(`${sources} 个来源待核对`)
-  if (pending) counts.push(`${pending} 项操作等待同步`)
-  const other = items.length - sources - pending
-  if (other) counts.push(`${other} 项待核对`)
-  if (!counts.length && state?.sync_result?.failed_group_ids?.length)
+  const decisions = items.filter(needsDecision).length
+  if (decisions) return `${decisions} 项需要你确认`
+  if (state?.connected && !state.auto_enabled) return '已暂停'
+  if (items.some(item => item.type === 'scan_claim') || state?.sync_result?.held_group_ids?.length)
+    return '部分内容暂未更新'
+  if (items.some(item => item.type === 'operation' && item.state === 'pending')) return '更改等待同步'
+  if (state?.sync_result?.failed_group_ids?.length)
     return `${state.sync_result.failed_group_ids.length} 个来源暂时无法更新`
-  if (!counts.length && state?.readonly_issues?.length) return `${state.readonly_issues.length} 项仅支持从 Apple 读取`
-  return counts.join(' · ') || '上次同步未全部完成'
+  if (state?.readonly_issues?.length) return `${state.readonly_issues.length} 项仅支持从 Apple 读取`
+  return '部分内容暂未更新'
 }
 
 export function needsDecision(item) {
-  return (item.type === 'scan_claim' && !!reviewAction(item)) || item.type === 'legacy_deletion' || (item.type === 'record' && !item.source_check && !boundConflictPending(item)
+  return item.deletion_phase === 'needs_confirmation' || item.type === 'legacy_deletion' || (item.type === 'record' && !item.source_check && !boundConflictPending(item)
       && !item.local_restore_pending) || (item.type === 'category' && ['name','color','missing_source','legacy_retained'].includes(item.kind))
 }
 
