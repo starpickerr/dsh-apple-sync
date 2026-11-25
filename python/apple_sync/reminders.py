@@ -70,6 +70,13 @@ def _hash(row, *, remote=False):
     return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def same_completion(local, native):
+    # Both sides recorded completion independently. Keep each timestamp in its own history.
+    return (local.get('status') == 'completed' and native.get('completed') is True
+            and bool(local.get('completed_at') and native.get('completed_at'))
+            and _hash({**local, 'completed_at': native['completed_at']}) == _hash(native, remote=True))
+
+
 def _source_key(remote):
     identity = remote.get("external_id") or "\0".join((remote["list_id"], remote["reminder_id"]))
     return "eventkit:" + hashlib.sha256(identity.encode()).hexdigest()
@@ -766,6 +773,8 @@ class AppleReminderSync:
             local_extra=remote_extra=(metadata(local)['timezone']!=metadata(remote,True)['timezone'] or bool(local.get('floating'))!=bool(remote.get('floating')))
         local_changed=_hash(local)!=mapping['local_hash'] or local_extra
         remote_changed=_hash(remote,remote=True)!=mapping['remote_hash'] or remote_extra
+        if local_changed and remote_changed and old and not local_extra and not remote_extra and same_completion(local, remote):
+            local_changed = remote_changed = False
         reason=None
         if local_changed and remote_changed:
             from apple_sync.sync_merge import merge_bound_item
