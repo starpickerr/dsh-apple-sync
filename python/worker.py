@@ -130,10 +130,25 @@ class AppleWorker:
             raise RuntimeError('Apple sync is disabled for this verification process')
         from apple_sync import sync_recovery
         manager = self.managers[kind]
+        if action == 'open_apple_app':
+            import subprocess
+            app = {'calendar': 'com.apple.iCal', 'reminders': 'com.apple.reminders'}[kind]
+            subprocess.run(['/usr/bin/open', '-b', app], check=True, timeout=10)
+            return {'status': 'opened'}
         with manager._lock:
+            if action == 'restart_category_check':
+                return sync_recovery.check_scan(manager, kind, identity, restart_category=True)
+            if action == 'sync_completion' and kind == 'reminders':
+                from apple_sync.reminder_completion import dispatch
+                row = next((op for op in manager.todos.apple_operations() if op['id'] == identity), None)
+                if not row:
+                    return {'status': 'gone'}
+                if not dispatch(manager, row['local_id'], identity):
+                    raise ValueError('请检查同步是否已开启及 Apple 访问权限，并刷新此操作的最新状态。')
+                return {'status': 'completed'}
             if action == 'keep_legacy':
                 return sync_recovery.keep_legacy(manager, kind, identity, revision)
-            if action == 'resume_verified_scan' and kind == 'calendar' and revision:
+            if action == 'resume_verified_scan' and revision:
                 return sync_recovery.check_scan(manager, kind, identity, revision)
             methods = {'check_scan': sync_recovery.check_scan, 'check_missing': sync_recovery.check_missing, 'preview_legacy': sync_recovery.preview_legacy,
                        'compare_record': sync_recovery.compare_record, 'compare_identity': sync_recovery.compare_identity}

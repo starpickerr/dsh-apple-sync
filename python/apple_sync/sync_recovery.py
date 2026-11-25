@@ -33,7 +33,7 @@ def _matches_mapping(kind, mapping, native):
     return _same_native_item(kind, mapping, native) and native.get('external_id') == mapping['external_id']
 
 
-def _legacy_scan_rows(db, attempt):
+def _legacy_scan_rows(db, attempt, kind):
     group, token, source = attempt['group_id'], attempt['attempt_id'], attempt['source_id']
     current = db.execute(
         'SELECT a.* FROM calendar_scan_groups g JOIN calendar_scan_attempts a USING(attempt_id) '
@@ -51,8 +51,9 @@ def _legacy_scan_rows(db, attempt):
         return None
     held = [row[0] for row in db.execute('SELECT local_id FROM calendar_scan_items WHERE attempt_id=? ORDER BY local_id', (token,))]
     mapped = []
-    for row in db.execute("SELECT m.*,s.value AS baseline FROM mappings m LEFT JOIN settings s ON s.key='item-metadata:'||m.alcor_id "
-                          "WHERE m.calendar_id=? ORDER BY m.id", (group,)):
+    local_key, group_key, _ = _shape(kind)
+    for row in db.execute(f"SELECT m.*,s.value AS baseline FROM mappings m LEFT JOIN settings s ON s.key='item-metadata:'||m.{local_key} "
+                          f"WHERE m.{group_key}=? ORDER BY m.{local_key}", (group,)):
         mapping = dict(row)
         baseline = mapping.pop('baseline')
         mapped.append((mapping, json.loads(baseline) if baseline else None))
@@ -97,12 +98,69 @@ def _legacy_scan_proof(sync, attempt, target, window, rows, locals_by_id, native
     return claims.digest([dict(attempt), target, rows, checked])
 
 
-def _release_category_check(sync, kind, attempt, document, target):
+def _reminder_scan_proof(sync, attempt, target, rows, locals_by_id, native_by_id):
+    """Close only a fully accounted-for scan. Divergent pairs go through conflict review."""
+    from apple_sync.metadata import metadata
+    link, held, mapped = rows
+    group = attempt['group_id']
+    verify_category_source(sync.todos.get_category(link['alcor_id']), link, target)
+    ids = {row['todo_id'] for row, _ in mapped}
+    if not held or set(held) != ids:
+        return None, [], '扫描涉及尚未核实关联的提醒。请在 Apple 中核对原清单和项目。'
+    pending = []
+    for op in sync.todos.apple_operations():
+        binding = op.get('binding') or {}
+        if op['local_id'] not in ids and op['local_id'] != link['alcor_id'] and binding.get('group_id') != group:
+            continue
+        if (op['entity'] != 'item' or op['action'] != 'complete' or op['state'] != 'pending'
+                or op['local_id'] not in ids or binding.get('group_id') != group or binding.get('source_id') != attempt['source_id']
+                or sync._get('reminder-completion:' + op['id'])):
+            return None, [], '清单内还有一项操作要先核对。请在同步设置中打开该操作，核对提交结果。'
+        pending.append([op['id'], op['local_id'], op['document'], binding])
+    seen, snapshots, differences = set(), [], []
+    for row, baseline in mapped:
+        identity, native_id = row['todo_id'], row['reminder_id']
+        local = locals_by_id.get(identity)
+        matches = native_by_id.get(native_id, [])
+        if row['state'] in ('deleted', 'remote_deleted') and not local and not matches:
+            continue
+        title = (local or {}).get('title') or (matches[0].get('title') if matches else None) or '未命名提醒'
+        if (len(matches) != 1 or native_id in seen or row['state'] not in ('active','conflict','deleted','remote_deleted')
+                or not _matches_mapping('reminders', row, matches[0])):
+            return None, [], f'「{title}」的原提醒或关联无法确认。请在 Apple 中核对它是否仍在此清单、是否被移动。'
+        native = matches[0]
+        if not local:
+            # The retained native item is an explicit local-restore decision, never a pending deletion.
+            seen.add(native_id)
+            snapshots.append([None, native])
+            differences.append((identity, title))
+            continue
+        if row['state'] in ('deleted', 'remote_deleted') or not baseline:
+            return None, [], f'「{title}」的历史关联或同步基线不完整，请先在 Apple 中核对原提醒。'
+        binding = local.get('apple') or {}
+        if (local.get('category_id') != link['alcor_id'] or binding.get('group_id') != group
+                or binding.get('apple_id') != native_id or binding.get('source_id') != attempt['source_id']):
+            return None, [], f'「{title}」的本地关联与 Apple 来源不一致，请核对所属账户和清单。'
+        seen.add(native_id)
+        snapshots.append([local, native])
+        if row['state'] == 'active' and (row['missing_since'] or
+                _hashes('reminders', local, native, row) != (row['local_hash'], row['remote_hash'])
+                or baseline != [metadata(local), metadata(native, True)]):
+            differences.append((identity, title))
+    retired = set(sync._get('retired_reminder_ids', []))
+    extra = set(native_by_id) - seen - retired
+    if extra:
+        title = native_by_id[sorted(extra)[0]][0].get('title') or '未命名提醒'
+        return None, [], f'Apple 中有 {len(extra)} 项无法对应到原记录，例如「{title}」。请先核对这些提醒的来源。'
+    return claims.digest([dict(attempt), target, rows, snapshots, pending, differences, sorted(retired)]), differences, ''
+
+
+def _release_category_check(sync, kind, attempt, document, target, *, restart=False):
     # Category property writes must leave "claimed" before calling Apple or the owner.
     operation = document['evidence']
     group, source, token = attempt['group_id'], attempt['source_id'], attempt['attempt_id']
     link = operation['link']
-    if (attempt['state'] != 'uncertain' or document.get('groups') != {group: source}
+    if (attempt['state'] not in (('uncertain', 'scanning') if restart else ('uncertain',)) or document.get('groups') != {group: source}
             or operation['native'].get('id') != group or operation['native'].get('source_id') != source
             or link.get('apple_id') != group or operation['expected'].get('local_id') != link.get('alcor_id')):
         return False
@@ -130,6 +188,12 @@ def _release_category_check(sync, kind, attempt, document, target):
 
 
 def _finish_operation_receipt(sync, kind, attempt_id, operation):
+    if kind == 'reminders' and operation.get('action') == 'complete' and operation.get('id'):
+        from apple_sync import reminder_completion
+        journal = sync._get(reminder_completion.PREFIX + operation['id']) or {}
+        if journal.get('stage') == 'receipt' and journal['operation'] == operation:
+            reminder_completion.process(sync, sync.todos, {**operation, 'state': 'uncertain'})
+            return not any(row['attempt_id'] == attempt_id for row in claims.status(sync))
     if operation.get('kind') == 'manual_item_restore':
         from apple_sync.item_restore import finish_pending
         owner = sync.todos if kind == 'reminders' else sync.calendar
@@ -153,7 +217,7 @@ def _finish_operation_receipt(sync, kind, attempt_id, operation):
     return False
 
 
-def check_scan(sync, kind, attempt_id, revision=None):
+def check_scan(sync, kind, attempt_id, revision=None, *, restart_category=False):
     with sync._connect() as db:
         db.execute('BEGIN')
         if not claims.schema(db):
@@ -166,12 +230,16 @@ def check_scan(sync, kind, attempt_id, revision=None):
             return {'status': 'gone'}
         held = db.execute('SELECT count(*) FROM calendar_scan_items WHERE attempt_id=?', (attempt_id,)).fetchone()[0]
         evidence = json.loads(attempt['evidence'])
-        legacy = kind == 'calendar' and attempt['state'] == 'uncertain' and evidence == {}
-        rows = _legacy_scan_rows(db, attempt) if legacy else None
+        window = json.loads(attempt['window'])
+        legacy = attempt['state'] == 'uncertain' and evidence == {} and (
+            kind == 'calendar' and isinstance(window, list) and len(window) == 2
+            or kind == 'reminders' and window == {'kind': 'reminder_scan'})
+        rows = _legacy_scan_rows(db, attempt, kind) if legacy else None
     if revision is not None and not rows:
         raise ValueError('旧同步范围已变化，请重新核对')
     reminder = kind == 'reminders'
-    window = json.loads(attempt['window'])
+    if restart_category and not (window == {'kind': 'manager_work'} and claims.unstarted_category_check(evidence)):
+        raise ValueError('分类检查已进入其他阶段，请重新打开详情核对。')
     try:
         target = _source(sync, kind, attempt['group_id'], attempt['source_id'])
         if evidence.get('stage') in ('merge_sending', 'merge_rechecking'):
@@ -187,7 +255,7 @@ def check_scan(sync, kind, attempt_id, revision=None):
             inventory = sync.bridge.call('events', calendar_ids=[attempt['group_id']], start=window[0], end=window[1])
         else:
             if window == {'kind': 'manager_work'} and claims.unstarted_category_check(evidence):
-                if _release_category_check(sync, kind, attempt, evidence, target):
+                if _release_category_check(sync, kind, attempt, evidence, target, restart=restart_category):
                     return {'status': 'released'}
                 return {'status': 'needs_evidence', 'held': held, 'checked': None}
             if _finish_operation_receipt(sync, kind, attempt_id, evidence.get('evidence', {})):
@@ -224,7 +292,14 @@ def check_scan(sync, kind, attempt_id, revision=None):
             if local and _hashes(kind, local, native[0], row) == (row['local_hash'], row['remote_hash']):
                 unchanged += 1
     result = {'status': 'needs_evidence', 'held': held, 'checked': len(inventory[rows_key]), 'matched': matched, 'unchanged': unchanged}
-    proof = _legacy_scan_proof(sync, attempt, target, window, rows, locals_by_id, native_by_id) if rows is not None else None
+    proof = None
+    differences = []
+    if rows is not None:
+        if reminder:
+            proof, differences, reason = _reminder_scan_proof(sync, attempt, target, rows, locals_by_id, native_by_id)
+            result.update(differences=[name for _, name in differences], message=reason)
+        else:
+            proof = _legacy_scan_proof(sync, attempt, target, window, rows, locals_by_id, native_by_id)
     if revision is None:
         return {**result, 'status': 'verified', 'revision': proof} if proof else result
     if not proof or revision != proof:
@@ -233,8 +308,11 @@ def check_scan(sync, kind, attempt_id, revision=None):
     with sync._connect() as db:
         db.execute('BEGIN IMMEDIATE')
         claims.schema(db)
-        if _legacy_scan_rows(db, attempt) != rows:
+        if _legacy_scan_rows(db, attempt, kind) != rows:
             raise ValueError('同步占用或范围已变化，请重新核对')
+        for identity, _ in differences:
+            db.execute("UPDATE mappings SET state='conflict',missing_since='',conflict=? WHERE todo_id=?",
+                       ('恢复同步时发现内容有变化，请比较两侧后选择保留的内容', identity))
         audit = {'stage':'verified_baseline', 'previous_state':'uncertain', 'revision':proof,
                  'checked':result['checked'], 'held':held, 'completed_at':sync.clock()}
         db.execute("UPDATE calendar_scan_attempts SET state='done', evidence=? WHERE attempt_id=?", (json.dumps(audit), attempt_id))

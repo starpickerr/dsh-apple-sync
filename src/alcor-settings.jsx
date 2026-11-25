@@ -1,7 +1,7 @@
 import { Notice } from '../../Alcor/packages/alcor-plugin-info/src/notice.jsx'
 import React, { useEffect, useRef, useState } from 'react'
 import { Button, Modal, IconCheckOutlineRegular, IconChecklistOutlineRegular, IconClockOutlineRegular, IconWarningOutlineRegular, IconChevronRightOutlineRegular, IconCloseOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
-import { connectionStatus, formatSyncTime, reviewItems, resolutionRequest, deletionPhaseLabel, canRestoreLocalItem, boundConflictPending, syncSource, reviewAction, needsDecision } from './presentation.js'
+import { connectionStatus, formatSyncTime, reviewItems, resolutionRequest, deletionPhaseLabel, canRestoreLocalItem, boundConflictPending, syncSource, reviewAction, needsDecision, syncStatusLabel } from './presentation.js'
 import { createCategoryRebuildPage } from './category-rebuild-page.js'
 import { SettingsDialog } from './settings-dialog.jsx'
 
@@ -19,7 +19,7 @@ function Choice({ value, selected, change, title, children, danger, disabled }) 
   </label>
 }
 
-function Review({ item, kind, state, busy: outsideBusy, error: outsideError, close, resolve, api, finishRebuild }) {
+function Review({ item, kind, state, blocker, queued, withdraw, select, finishReview, busy: outsideBusy, error: outsideError, close, resolve, api, finishRebuild }) {
   const boundPending = boundConflictPending(item)
   const [choice, setChoice] = useState(boundPending?.choice ?? '')
   const [rebuildPlan, setRebuildPlan] = useState(null)
@@ -42,6 +42,8 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
   const groupLabel = kind === 'calendar' ? '日历' : '清单'
   const uncertain = item.type === 'operation' && ['sending', 'uncertain'].includes(item.state)
   const pendingDelete = item.type === 'operation' && ['delete', 'truncate', 'exclude'].includes(item.action)
+  const completion = kind === 'reminders' && item.type === 'operation' && item.entity === 'item' && item.action === 'complete' && item.state === 'pending'
+  const appName = kind === 'reminders' ? '提醒事项' : '日历'
   const retained = ['identity_candidate','scan_claim','category_create','category_retained','marker_conflict'].includes(item.type)
   const categoryWaiting = ['category_waiting', 'unverified_category_identity', 'unverified_empty_category'].includes(item.kind)
   const review = reviewAction(item)
@@ -50,7 +52,7 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
   const detailsOnly = retained || categoryWaiting || item.source_check
   const single = item.type === 'operation' || item.kind === 'legacy_retained'
   const diagnostic = !item.source_check && !['scan_claim', 'category_create', 'category_retained'].includes(item.type) && (item.reason || item.error)
-  const actionable = !detailsOnly && !uncertain && (!compare || !!checked) && (single || item.type === 'record' || ['name', 'color', 'missing_source'].includes(item.kind))
+  const actionable = !queued && !detailsOnly && !uncertain && (!compare || !!checked) && (single || item.type === 'record' || ['name', 'color', 'missing_source'].includes(item.kind))
   const title = rebuildPlan ? `确认创建空 Apple ${groupLabel}？` : detailsOnly ? '同步详情' : confirm ? `删除 Alcor ${groupLabel}？` : uncertain ? item.state === 'sending' ? '正在向 Apple 提交' : '请核对 Apple 操作结果' : item.type === 'operation' ? pendingDelete ? deletionPhaseLabel(item) : '等待同步' : '处理同步冲突'
   const apply = async () => {
     if (missing && choice === 'keep_alcor') {
@@ -63,12 +65,16 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
       return
     }
     if (destructive && !confirm) setConfirm(true); else resolve(single ? item.type === 'operation' ? 'cancel' : 'acknowledge' : choice, source, checked?.revision) }
-  async function inspect() {
+  async function inspect(action = review) {
     setRebuilding(true); setRebuildError(''); setChecked(null); setChoice('')
     try {
-      const result = await api.reviewSync({ kind, action:review, identity:item.attempt_id ?? item.identity ?? item.alcor_id ?? item.todo_id })
+      const result = await api.reviewSync({ kind, action, identity:item.type === 'operation' ? item.id : item.attempt_id ?? item.identity ?? item.alcor_id ?? item.todo_id ?? item.key })
       if (!result.ok) throw new Error(result.error?.message ?? '暂时无法核对，请重试。')
-      if (mounted.current) setChecked(result.value)
+      if (mounted.current) {
+        if (['completed','receipt_finished','released','gone'].includes(result.value.status)) {
+          await finishReview(result.value.status === 'completed' ? '这条提醒的完成状态已同步。' : result.value.status === 'gone' ? '原操作已结束，已刷新同步状态。' : '已完成核对，此来源可继续同步。')
+        } else if (action !== 'open_apple_app') setChecked(result.value)
+      }
     } catch (failure) { if (mounted.current) setRebuildError(failure.message) }
     finally { if (mounted.current) setRebuilding(false) }
   }
@@ -77,10 +83,23 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
     try {
       const result = await api.reviewSync({ kind, action:'resume_verified_scan', identity:item.attempt_id, revision:checked.revision })
       if (!result.ok) throw new Error(result.error?.message ?? '暂时无法恢复同步，请重新核对。')
-      if (mounted.current) setChecked(result.value)
+      if (mounted.current) {
+        if (result.value.status === 'baseline_restored') await finishReview(result.value.differences?.length ? '已恢复此清单，请在「需要你确认」中逐项比较有变化的提醒。' : '已恢复此来源的同步。')
+        else if (result.value.status === 'gone') await finishReview('原操作已结束，已刷新同步状态。')
+        else setChecked(result.value)
+      }
     } catch (failure) {
       if (mounted.current) { setChecked(null); setRebuildError(failure.message) }
     } finally { if (mounted.current) setRebuilding(false) }
+  }
+  async function withdrawAndCompare() {
+    setRebuilding(true); setRebuildError('')
+    try {
+      const fresh = await withdraw(queued.id)
+      if (mounted.current && !fresh.operations?.some(op => op.entity === 'item' && op.local_id === item.todo_id))
+        await inspect()
+    } catch (failure) { if (mounted.current) setRebuildError(failure.message) }
+    finally { if (mounted.current) setRebuilding(false) }
   }
   return <Modal open title={title} headless className="apple-sync-review" onClose={() => { if (!busy) close() }}>
     <header className="apple-sync-review-header"><h2>{title}</h2><Button variant="ghost" size="sm" aria-label="关闭处理窗口" disabled={busy} onClick={close}><IconCloseOutlineRegular size={18} /></Button></header>
@@ -88,14 +107,15 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
       <div className="apple-sync-subject"><span className="apple-sync-eyebrow">{item.label}</span><h3>{item.title}</h3>{item.source && <p>{item.source}</p>}{localRestore && <p>Alcor ID：{item.alcor_id ?? item.todo_id}</p>}</div>
       {rebuildPlan ? <Notice tone="warning" className="apple-sync-notice"><strong>在 {rebuildPlan.source.title || rebuildPlan.source.name || rebuildPlan.source_id} 创建空{groupLabel}「{rebuildPlan.title}」</strong><p>只创建容器，不上传原成员。以下 {rebuildPlan.retained_members.length} 项及旧关联证据保留在本地，等待重新关联。</p><ul>{rebuildPlan.retained_members.map(member => <li key={member.id}>{member.title}</li>)}</ul></Notice> : confirm ? <Notice tone="warning" className="apple-sync-danger-note"><strong>将删除此{groupLabel}及其中全部{kind === 'calendar' ? '日程' : '事务'}。</strong><p>只有确认 Apple 中的来源已被删除时，才选择此操作。Alcor 中的删除无法撤销。</p></Notice> : <>
         {item.type === 'scan_claim' ? <>
-          {checked?.status !== 'baseline_restored' && <Notice tone="warning" className="apple-sync-notice">{item.state === 'uncertain' ? `上次操作结果待核对，此${groupLabel}暂停更新。可继续同步其他来源。` : `此${groupLabel}仍有同步操作在处理，请稍后查看。`}</Notice>}
+          {checked?.status !== 'baseline_restored' && <Notice tone="warning" className="apple-sync-notice">{item.background_check ? '上次分类检查停在提交之前。可以重新检查此来源，后续同步会重新读取分类。' : item.state === 'uncertain' ? `上次操作结果待核对，此${groupLabel}暂停更新。可继续同步其他来源。` : `此${groupLabel}仍有同步操作在处理，请稍后查看。`}</Notice>}
           {checked && <p role="status">{checked.status === 'baseline_restored' ? '已解除旧同步占用。后续同步会沿用核实过的关联。'
-            : checked.status === 'verified' ? `已完整核对 ${checked.checked} 项，当前内容和关联一致。可以恢复此日历的同步。`
+            : checked.status === 'verified' ? `已核对原来源及项目关联。恢复后，${checked.differences?.length ? checked.differences.length + ' 项有变化的提醒将转入「需要你确认」，保留两侧内容' : '将继续处理后续同步'}。`
             : checked.status === 'receipt_finished' ? '已根据原回执完成本地收尾。'
             : checked.status === 'released' ? '此来源可以继续同步。'
             : checked.status === 'gone' ? '该操作已结束，请刷新同步状态。' : checked.status === 'source_unavailable'
             ? '暂时无法完整读取原来源，请检查 Apple 账户和权限。'
-            : '暂时无法确认上次更改，已保留当前内容。'}</p>}
+            : checked.message || `请打开 Apple ${appName}，在原账户和「${item.title}」中核对上次更改，再回到这里重新核对。`}</p>}
+          {!!checked?.differences?.length && <ul>{checked.differences.map((name, index) => <li key={index}>{name}</li>)}</ul>}
         </> : item.source_check ? <>
           <Notice tone="warning" className="apple-sync-notice">{item.reason}</Notice>
           {checked && <p role="status">{checked.status === 'present' ? `已在「${checked.source}」找到原项目。可重新同步以核对当前内容。` : `未在「${checked.source}」找到原项目。仍需核对是否被移动或删除，现有内容已保留。`}</p>}
@@ -106,10 +126,11 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
             {checked.alcor.map(original => <tr key={original.id}><th scope="row">Alcor 原项目</th><td>{original.title}{original.date && <p>{formatSyncTime(original.date) || original.date}</p>}</td><td>{original.source || '未知'}</td></tr>)}
           </tbody></table>}
         </> : categoryWaiting ? <Notice tone="warning" className="apple-sync-notice">已保留原关联和内容。Alcor 会在下次同步时重新检查 Apple 来源。</Notice> : retained ? <Notice tone="warning" className="apple-sync-notice"><strong>{item.label}</strong><p>{item.type === 'marker_conflict' ? '旧关联来源或当前内容尚未核实。两侧内容和核对证据已保留，此项目不会自动重新关联或发送，其他正常项目继续同步。' : item.reason}</p><p>{formatSyncTime(item.observed_at || item.started_at)}</p></Notice> : item.type === 'operation' ? uncertain ? <Notice tone="warning" className="apple-sync-notice"><strong>{item.state === 'sending' ? '正在向 Apple 提交' : 'Apple 操作结果未知'}</strong><p>{item.state === 'sending' ? '请等待本机操作结果；暂不能取消此请求。' : '本地内容和证据已保留，请核对；此操作不会自动重试，不能当作尚未发送。'}</p></Notice> : <>
-          <Notice className="apple-sync-notice"><strong>本地内容仍然保留</strong><p>{pendingDelete ? item.document?._confirmed_intent ? '本次具体删除已确认。断线或重启后，目标、内容、范围与权限不变且明确尚未发送时会继续；可取消此次操作或暂停同步。' : 'Alcor 将请求 Apple 删除，并在本机操作完成后处理本地记录。等待本次具体确认，可取消此请求。' : '此操作尚未提交，下次同步会继续处理，也可以取消此次操作。'}</p></Notice>
+          <Notice className="apple-sync-notice"><strong>本地内容仍然保留</strong><p>{pendingDelete ? item.document?._confirmed_intent ? '本次具体删除已确认。断线或重启后，目标、内容、范围与权限不变且明确尚未发送时会继续；可取消此次操作或暂停同步。' : 'Alcor 将请求 Apple 删除，并在本机操作完成后处理本地记录。等待本次具体确认，可取消此请求。' : blocker ? '这项操作已记录，正在等待所属来源完成核对。' : '这项操作已记录，尚未提交到 Apple。'}</p></Notice>
+          {blocker && <Notice tone="warning">{blocker.type === 'record' ? '这条提醒的两侧内容有变化。先处理内容冲突，再决定是否完成提醒。' : `「${blocker.title}」的上次同步尚待核对。先处理这个${groupLabel}，再同步本项。`}</Notice>}
           <ol className="apple-sync-progress"><li data-done><IconCheckOutlineRegular size={15} /><span>已记录操作</span></li><li aria-current="step"><IconClockOutlineRegular size={15} /><span>{pendingDelete ? deletionPhaseLabel(item) : '等待同步'}</span></li><li><span className="apple-sync-progress-dot" /><span>完成同步</span></li></ol>
           <Notice className="apple-sync-support">取消仅撤回这次待处理操作，保留现有内容。</Notice>
-        </> : legacy || item.kind === 'legacy_delete' ? <Notice tone="warning" className="apple-sync-notice">
+        </> : queued ? <Notice tone="warning">这条提醒还有一项「{queued.label}」。{queued.state === 'pending' ? '可以先撤回尚未发送的请求，再比较两侧内容。' : '请先查看原操作的提交结果。'}</Notice> : legacy || item.kind === 'legacy_delete' ? <Notice tone="warning" className="apple-sync-notice">
           <strong>{checked?.title || '旧版删除需要重新核对'}</strong>
           <p>{checked ? `Apple ${checked.source} · 保留此项目会撤销原删除待办。` : '当前内容已保留。先核实原 Apple 项目，再选择如何保留。'}</p>
         </Notice> : item.kind === 'legacy_retained' ? <Notice className="apple-sync-support">旧版遗留内容已保留。确认后会移除此提示，不会删除内容。</Notice> : <>
@@ -139,16 +160,21 @@ function Review({ item, kind, state, busy: outsideBusy, error: outsideError, clo
           {showDiagnostic && <pre>{[].concat(diagnostic).join('\n')}</pre>}
         </div>}
       </>}
-      {error && <Notice tone="error" role="alert" className="apple-sync-error">{error}</Notice>}
+      {error && <Notice tone="error" role="alert" className="apple-sync-error">{error}{completion && <p>也可在 Apple 提醒事项中核对这一项。若已手动完成，可取消仍在等待的这次请求。</p>}</Notice>}
     </div>
     <footer className="apple-sync-review-footer">{!detailsOnly && <span>{rebuildPlan ? '仅创建空容器，不上传原成员' : confirm ? '此操作无法撤销' : '确认前不会更改内容'}</span>}<div><Button ref={backButton} variant="outline" disabled={busy} onClick={() => { if (rebuildPlan) { rebuildPage.current.invalidate(); setRebuildPlan(null) } else if (confirm) setConfirm(false); else close() }}>{confirm || rebuildPlan ? '返回' : detailsOnly ? '关闭' : '暂不处理'}</Button>
-      {review && checked?.status !== 'baseline_restored' && <Button variant={checked && (review !== 'check_scan' || checked.status === 'verified') ? 'outline' : 'primary'} disabled={busy} onClick={() => void inspect()}>{review === 'compare_record' ? '比较差异' : review === 'compare_identity' ? '比较候选' : '重新核对'}</Button>}
+      {(uncertain || completion && error || detailsOnly) && <Button variant="outline" disabled={busy} onClick={() => void inspect('open_apple_app')}>打开 Apple {appName}</Button>}
+      {queued && (queued.state === 'pending' && compare
+        ? <Button variant="primary" disabled={busy} onClick={() => void withdrawAndCompare()}>撤回待同步请求并比较</Button>
+        : <Button variant="primary" disabled={busy} onClick={() => select(queued.key)}>查看待处理操作</Button>)}
+      {review && !queued && checked?.status !== 'baseline_restored' && <Button variant={checked && (review !== 'check_scan' || checked.status === 'verified') ? 'outline' : 'primary'} disabled={busy} onClick={() => void inspect()}>{review === 'compare_record' ? '比较差异' : review === 'compare_identity' ? '比较候选' : review === 'restart_category_check' ? '重新检查此来源' : '重新核对'}</Button>}
       {checked?.status === 'verified' && <Button variant="primary" disabled={busy} onClick={() => void resumeVerifiedScan()}>恢复同步</Button>}
       {legacy && checked?.revision && <>
         {checked.can_restore && <Button variant="outline" disabled={busy} onClick={() => resolve('restore_legacy', null, checked.revision)}>恢复到 Alcor</Button>}
         <Button variant="primary" disabled={busy} onClick={() => resolve('keep_legacy', null, checked.revision)}>{kind === 'reminders' ? '保留提醒' : '保留日程'}</Button>
       </>}
-      {actionable && <Button variant="primary" className={confirm ? 'apple-sync-destructive' : ''} disabled={busy || (!single && !choice) || (missing && choice === 'keep_alcor' && !source)} onClick={apply}>{busy ? '处理中…' : rebuildPlan ? `确认创建空${groupLabel}` : missing && choice === 'keep_alcor' ? '查看创建预览' : confirm ? `删除 Alcor ${groupLabel}` : destructive ? '继续…' : item.type === 'operation' ? '取消此次操作' : item.kind === 'legacy_retained' ? '确认保留' : boundPending ? '核对处理结果' : restorePending ? '核对恢复结果' : localRestore ? '恢复到 Alcor' : '确认并同步'}</Button>}</div></footer>
+      {actionable && <Button variant={completion || blocker ? 'outline' : 'primary'} className={confirm ? 'apple-sync-destructive' : ''} disabled={busy || (!single && !choice) || (missing && choice === 'keep_alcor' && !source)} onClick={apply}>{busy ? '处理中…' : rebuildPlan ? `确认创建空${groupLabel}` : missing && choice === 'keep_alcor' ? '查看创建预览' : confirm ? `删除 Alcor ${groupLabel}` : destructive ? '继续…' : item.type === 'operation' ? '取消此次操作' : item.kind === 'legacy_retained' ? '确认保留' : boundPending ? '核对处理结果' : restorePending ? '核对恢复结果' : localRestore ? '恢复到 Alcor' : '确认并同步'}</Button>}
+      {blocker ? <Button variant="primary" disabled={busy} onClick={() => select(blocker.key)}>{blocker.type === 'record' ? '处理内容冲突' : `处理阻塞的${groupLabel}`}</Button> : completion && <Button variant="primary" disabled={busy} onClick={() => void inspect('sync_completion')}>立即同步此项</Button>}</div></footer>
   </Modal>
 }
 
@@ -241,11 +267,22 @@ function Connection({ kind, api }) {
     ...(state.sync_result?.retrying_group_ids ?? []), ...backgroundChecks.map(row => row.group_id),
   ])] : []
   const retryingNames = retrying.map(id => syncSource(state, id).title).filter(Boolean)
-  const failed = [...new Set(state?.sync_result?.failed_group_ids ?? [])].filter(id => !retrying.includes(id) && !items.some(item => item.group_id === id || item.apple_id === id))
+  const failed = [...new Set([...(state?.sync_result?.failed_group_ids ?? []), ...(state?.sync_result?.held_group_ids ?? [])])].filter(id => !retrying.includes(id) && !items.some(item => item.group_id === id || item.apple_id === id))
   const failedNames = failed.map(id => syncSource(state, id).title).filter(Boolean)
   const checked = state?.sync_result?.checked_group_ids?.length
   const syncError = message || readError || (status.tone === 'error' ? state?.error : '')
   const current = items.find(item => item.key === selected)
+  const blocker = current?.type === 'operation' && (items.find(item => item.type === 'scan_claim' && item.group_id && item.group_id === current.binding?.group_id)
+    || items.find(item => item.type === 'record' && item.todo_id && item.todo_id === current.local_id))
+  const queued = current?.type === 'record' && items.find(item => item.type === 'operation' && item.entity === 'item' && item.local_id && item.local_id === current.todo_id)
+  async function finishReview(text) {
+    const started = ++revision.current
+    const fresh = await call('status')
+    if (started === revision.current) {
+      ++revision.current
+      setState(fresh); setSelected(null); setNotice(text); setMessage('')
+    }
+  }
   useEffect(() => { if (selected && !current) setSelected(null) }, [selected, current])
   const readOnly = options.filter(source => !source.writable)
   const readOnlyIssues = state?.readonly_issues ?? []
@@ -254,19 +291,19 @@ function Connection({ kind, api }) {
   const hasDetails = !!(readOnly.length || readOnlyIssues.length || coverage.length || diagnostic)
   const Icon = kind === 'calendar' ? IconClockOutlineRegular : IconChecklistOutlineRegular
   return <section className="apple-sync-connection" aria-label={title}>
-    <div className="apple-sync-heading"><div className="apple-sync-service"><span className="apple-sync-service-icon"><Icon size={22} /></span><div><h3>{title}</h3><span className="apple-sync-badge" data-tone={status.tone} role="status"><span className="apple-sync-dot" aria-hidden="true" />{status.label === '部分同步 · 待处理' && !items.some(needsDecision) ? '部分同步' : status.label}</span></div></div><div className="apple-sync-actions"><Button variant="outline" size="sm" disabled={busy || !active} onClick={() => void run(async () => setState(await call('disconnect')))}>暂停同步</Button><Button variant="primary" size="sm" disabled={busy || !state?.supported} onClick={() => void run(sync)}>{busy ? '处理中…' : '同步'}</Button></div></div>
+    <div className="apple-sync-heading"><div className="apple-sync-service"><span className="apple-sync-service-icon"><Icon size={22} /></span><div><h3>{title}</h3><span className="apple-sync-badge" data-tone={status.tone} role="status"><span className="apple-sync-dot" aria-hidden="true" />{syncStatusLabel(status, items, state)}</span></div></div><div className="apple-sync-actions"><Button variant="outline" size="sm" disabled={busy || !active} onClick={() => void run(async () => setState(await call('disconnect')))}>暂停同步</Button><Button variant="primary" size="sm" disabled={busy || !state?.supported} onClick={() => void run(sync)}>{busy ? '处理中…' : '同步'}</Button></div></div>
     <div className="apple-sync-metadata">{formatSyncTime(state?.last_success) && <span>上次成功同步 <time dateTime={state.last_success}>{formatSyncTime(state.last_success)}</time></span>}{!!state?.links?.length && <span>{state.links.length} 个{kind === 'calendar' ? '日历' : '清单'}已关联</span>}</div>
     {state && state.authorization !== 'full_access' && <Notice tone="warning" className="apple-sync-notice"><p>{authorizations[state.authorization] || '需要系统完整访问授权。'}</p></Notice>}
     {state?.watch_degraded && <Notice tone="warning" className="apple-sync-notice"><p>当前 Apple 连接组件不支持实时监听，将继续定期同步。更新连接组件后可恢复实时监听。</p></Notice>}
     {syncError && !current && <Notice tone="error" className="apple-sync-notice" role="alert"><strong>{readError ? '暂时无法读取同步状态' : '同步未完成'}</strong><p>{syncError}</p></Notice>}
-    {status.tone === 'warning' && !!(checked || failed.length || retrying.length) && <div className="apple-sync-metadata">
-      {!!checked && <span>本次已检查 {checked} 个{kind === 'calendar' ? '日历' : '清单'}</span>}
+    {status.tone === 'warning' && (checked != null || !!failed.length || !!retrying.length) && <div className="apple-sync-metadata">
+      {checked != null && <span>本次已检查 {checked} 个{kind === 'calendar' ? '日历' : '清单'}</span>}
       {!!retrying.length && <span>{retryingNames.length === retrying.length ? retryingNames.join('、') : `${retrying.length} 个来源`}{active ? '稍后自动重试' : '将在下次同步时重试'}</span>}
       {!!failed.length && <span>{failedNames.length === failed.length ? failedNames.join('、') : `${failed.length} 个来源`}暂时无法更新</span>}
     </div>}
     {[true, false].map(decision => {
       const rows = items.filter(item => needsDecision(item) === decision)
-      return !!rows.length && <div key={String(decision)} className="apple-sync-inbox"><div className="apple-sync-inbox-heading"><h4>{decision ? '需要你确认' : '同步状态'} <span>{rows.length}</span></h4></div><div className="apple-sync-rows">{rows.map(item => <button type="button" key={item.key} className="apple-sync-row" disabled={busy} onClick={() => {setMessage(''); setSelected(item.key)}}><span className="apple-sync-row-icon" data-pending={item.type === 'operation'}>{item.type === 'operation' ? <IconClockOutlineRegular size={18} /> : <IconWarningOutlineRegular size={18} />}</span><span className="apple-sync-row-text"><strong>{item.title}</strong><span>{item.label}{item.source && ` · ${item.source}`}</span></span><span className="apple-sync-row-action">{decision ? '处理' : '查看'}<IconChevronRightOutlineRegular size={14} /></span></button>)}</div></div>
+      return !!rows.length && <div key={String(decision)} className="apple-sync-inbox"><div className="apple-sync-inbox-heading"><h4>{decision ? '需要你确认' : '同步状态'} <span>{rows.length}</span></h4></div><div className="apple-sync-rows">{rows.map(item => <button type="button" key={item.key} className="apple-sync-row" disabled={busy} onClick={() => {setMessage(''); setSelected(item.key)}}><span className="apple-sync-row-icon" data-pending={item.type === 'operation'}>{item.type === 'operation' ? <IconClockOutlineRegular size={18} /> : <IconWarningOutlineRegular size={18} />}</span><span className="apple-sync-row-text"><strong>{item.title}</strong><span>{item.label}{item.source && ` · ${item.source}`}</span></span><span className="apple-sync-row-action">{decision ? '处理' : item.type === 'scan_claim' && reviewAction(item) ? '核对来源' : item.type === 'operation' && item.state === 'pending' ? '处理操作' : '查看'}<IconChevronRightOutlineRegular size={14} /></span></button>)}</div></div>
     })}
     {hasDetails && <div className="apple-sync-facts">
       <dl>
@@ -280,7 +317,8 @@ function Connection({ kind, api }) {
     {showDetails && <SyncDetails title={title} sources={readOnly} issues={readOnlyIssues} coverage={coverage}
       error={diagnostic} close={() => setShowDetails(false)} />}
     {notice && <Notice className="apple-sync-success" role="status"><IconCheckOutlineRegular size={16} />{notice}</Notice>}
-    {current && <Review key={current.key} item={current} kind={kind} state={state} api={api} finishRebuild={value => { setState(value); setSelected(null); setNotice('空 Apple 容器已创建；原成员保留本地，尚未重新关联。') }} busy={busy} error={message} close={() => setSelected(null)} resolve={(choice, source, revision) => void run(async () => {const request = resolutionRequest(current,kind,choice,source)
+    {current && <Review key={current.key} item={current} kind={kind} state={state} api={api} blocker={blocker} queued={queued} select={setSelected}
+      withdraw={async id => { ++revision.current; const fresh = await call('cancel_operation', { operation_id:id }); ++revision.current; setState(fresh); return fresh }} finishReview={finishReview} finishRebuild={value => { setState(value); setSelected(null); setNotice('空 Apple 容器已创建；原成员保留本地，尚未重新关联。') }} busy={busy} error={message} close={() => setSelected(null)} resolve={(choice, source, revision) => void run(async () => {const request = resolutionRequest(current,kind,choice,source)
       if (request.method === 'keep_legacy') {
         const kept = await api.reviewSync({ kind, action:'keep_legacy', ...request.arguments, revision })
         if (!kept.ok) throw new Error(kept.error?.message ?? '保留项目未完成。')

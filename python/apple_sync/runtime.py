@@ -25,6 +25,9 @@ def record_sync_result(sync, counts, error=''):
                'checked_at': sync.clock()}
     if counts.get('retrying_group_ids'):
         outcome['retrying_group_ids'] = counts['retrying_group_ids']
+    held = counts.get('export_held_groups') or counts.get('held_list_ids')
+    if held:
+        outcome['held_group_ids'] = held
     with sync._connect() as db:
         db.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',
                        [('error', json.dumps(error)), ('sync_result', json.dumps(outcome))])

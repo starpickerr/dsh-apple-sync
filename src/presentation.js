@@ -63,12 +63,13 @@ export function reviewItems(state, kind) {
     ...(state?.category_creates ?? []).map(item => ({ ...item, type: 'category_create', key: `create:${item.local_id}`, title: item.title || `${groupLabel}创建待核对`, label: ['owner_claiming','owner_committed'].includes(item.state) ? '本地分类提交待核对' : item.state === 'waiting' ? '分类创建等待重试' : '分类创建结果待核对', source: item.source_id || '' })),
     ...(state?.identity_candidates ?? []).map(item => ({ ...item, identity: item.key, type: 'identity_candidate', key: `identity:${item.key}`, title: item.native?.title || `${groupLabel}项目身份待核对`, label: '可能是同一项目', source: syncSource(state, item.native?.calendar_id ?? item.native?.list_id).source })),
     ...Array.from(scans).flatMap(([group, rows]) => {
-      const claims = rows.filter(row => !row.background_check)
+      const claims = rows.filter(row => !row.background_check || (row.state === 'scanning'
+        && state.sync_result?.status === 'partial' && !state.sync_result.checked_group_ids?.includes(row.group_id)))
       if (!claims.length) return []
       const item = claims.find(row => row.state === 'uncertain') ?? claims[0]
       const { title, source } = syncSource(state, item.group_id)
       return { ...item, claims, type: 'scan_claim', key: `claim:${group}`, title: title || `Apple ${groupLabel}`, source,
-        label: item.state === 'uncertain' ? (['owner_claiming','owner_committed'].includes(item.stage) ? '本地提交结果待核对' : '同步结果待核对') : '同步操作仍占用此来源' }
+        label: item.background_check ? '上次分类检查尚未结束' : item.state === 'uncertain' ? (['owner_claiming','owner_committed'].includes(item.stage) ? '本地提交结果待核对' : '同步结果待核对') : '同步操作仍占用此来源' }
     }),
     ...categories.filter(item => item.kind !== 'category_waiting' || !scans.has(item.apple_id)).map(item => {
       const local = groups.find(group => group.id === item.alcor_id)
@@ -90,6 +91,7 @@ export const boundConflictPending = item => ['keep_alcor', 'keep_apple'].include
 export const canRestoreLocalItem = item => !boundConflictPending(item) && item?.type === 'record' && (item.local_missing === true || item.local_restore_pending === true)
 
 export function reviewAction(item) {
+  if (item.type === 'scan_claim' && item.background_check && item.state === 'scanning') return 'restart_category_check'
   if (item.type === 'scan_claim' && (item.state === 'uncertain' || ['merge_sending','merge_rechecking'].includes(item.stage))) return 'check_scan'
   if (item.type === 'identity_candidate') return 'compare_identity'
   if (item.type === 'record' && item.source_check) return 'check_missing'
@@ -97,8 +99,23 @@ export function reviewAction(item) {
   if (item.type === 'record' && !canRestoreLocalItem(item) && !boundConflictPending(item)) return 'compare_record'
 }
 
+export function syncStatusLabel(status, items, state) {
+  if (status.label !== '部分同步 · 待处理') return status.label
+  const counts = []
+  const sources = items.filter(item => item.type === 'scan_claim').length
+  const pending = items.filter(item => item.type === 'operation' && item.state === 'pending').length
+  if (sources) counts.push(`${sources} 个来源待核对`)
+  if (pending) counts.push(`${pending} 项操作等待同步`)
+  const other = items.length - sources - pending
+  if (other) counts.push(`${other} 项待核对`)
+  if (!counts.length && state?.sync_result?.failed_group_ids?.length)
+    return `${state.sync_result.failed_group_ids.length} 个来源暂时无法更新`
+  if (!counts.length && state?.readonly_issues?.length) return `${state.readonly_issues.length} 项仅支持从 Apple 读取`
+  return counts.join(' · ') || '上次同步未全部完成'
+}
+
 export function needsDecision(item) {
-  return item.type === 'legacy_deletion' || (item.type === 'record' && !item.source_check && !boundConflictPending(item)
+  return (item.type === 'scan_claim' && !!reviewAction(item)) || item.type === 'legacy_deletion' || (item.type === 'record' && !item.source_check && !boundConflictPending(item)
       && !item.local_restore_pending) || (item.type === 'category' && ['name','color','missing_source','legacy_retained'].includes(item.kind))
 }
 
