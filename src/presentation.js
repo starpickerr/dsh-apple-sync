@@ -12,9 +12,11 @@ export function connectionStatus(state, busy, readFailed = false) {
       (state.error === 'Apple container is held by another unfinished operation' && state.scan_claims?.length) ||
       (!state.sync_result && state.error?.startsWith('部分') && !state.listing_error)) return { label: '部分同步 · 待处理', tone: 'warning' }
   if (state.error) return { label: '同步异常', tone: 'error' }
-  if (state.marker_conflicts?.length || state.category_conflicts?.length || state.operations?.length || state.scan_claims?.some(row => !row.background_check || row.state === 'uncertain') || state.category_creates?.length || state.retained_categories?.length || state.identity_candidates?.length || state.legacy_deletions?.length || state.links?.some(link => link.name_conflict)) return { label: '部分同步 · 待处理', tone: 'warning' }
+  if (state.marker_conflicts?.length || state.category_conflicts?.length || state.operations?.length || state.scan_claims?.some(row => row.state !== 'scanning') || state.category_creates?.length || state.retained_categories?.length || state.identity_candidates?.length || state.legacy_deletions?.length || state.links?.some(link => link.name_conflict)) return { label: '部分同步 · 待处理', tone: 'warning' }
   if (state.conflicts?.length) return { label: '待处理冲突', tone: 'warning' }
   if (state.readonly_issues?.length) return { label: '部分同步 · 含只读内容', tone: 'warning' }
+  if (state.connected && state.auto_enabled && state.scan_claims?.some(row => row.state === 'scanning' && !row.background_check))
+    return { label: '正在同步', tone: 'pending' }
   if (state.connected && state.auto_enabled) return { label: '自动同步已开启', tone: 'success' }
   return { label: state.connected || state.last_success || state.links?.length ? '已暂停' : '未开启', tone: 'neutral' }
 }
