@@ -17,3 +17,12 @@ test('only content choices appear under Needs your confirmation during recovery'
   assert.deepEqual(withConflict.filter(needsDecision).map(row => row.title), ['Two versions'])
   assert.equal(syncStatusLabel(connectionStatus(state, false), withConflict, state), '1 项需要你确认')
 })
+
+test('an ordinary scan after a successful pass shows progress', () => {
+  const state = { connected: true, auto_enabled: true, authorization: 'full_access',
+    sync_result: { status: 'success', checked_group_ids: ['one'] },
+    scan_claims: [{ group_id: 'one', state: 'scanning', window: '{"kind":"reminder_scan"}' }] }
+  assert.equal(connectionStatus(state, false).label, '正在同步')
+  state.scan_claims[0].state = 'uncertain'
+  assert.equal(connectionStatus(state, false).tone, 'warning')
+})
