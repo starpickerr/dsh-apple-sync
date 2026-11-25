@@ -731,6 +731,10 @@ class AppleReminderSync:
             return
         expected=self.todos.apple_capture_reminder_sync(local['id'],category_id)
         local=expected['local']
+        if local.get('apple_pending'):
+            # The queued operation owns this reminder. A normal scan can finish its other items.
+            counts['status']='partial'
+            return
         before=dict(mapping)
         baselines=self._reminder_baselines(local['id'])
         if category_id and local.get('category_id') != category_id:

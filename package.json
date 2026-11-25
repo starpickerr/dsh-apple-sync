@@ -1,6 +1,6 @@
 {
   "name": "@alcor/apple-sync",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Apple 日历与提醒事项：在 DSH 对话中查询和操作，可选连接 Alcor 同步。",
   "type": "module",
   "license": "MIT",

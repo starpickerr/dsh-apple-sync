@@ -66,6 +66,8 @@ def process(sync, service, operation):
             mapping=next((row for row in sync._maps() if row['todo_id']==operation['local_id']),None)
             if not mapping or mapping['list_id']!=group or mapping['reminder_id']!=binding['apple_id']:
                 raise ValueError('reminder completion mapping changed')
+            if mapping['state'] != 'active':
+                raise ValueError('请先核对这条提醒的内容冲突，再同步完成状态。')
             capture=service.apple_capture_reminder_completion(operation['local_id'],operation)
             current=sync.bridge.call('reminder_lookup',list_id=group,reminder_id=binding['apple_id'])['reminder']
             native=binding.get('native') or {}

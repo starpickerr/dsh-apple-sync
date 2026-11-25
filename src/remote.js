@@ -7,9 +7,10 @@ const syncIdentity = { kind:z.enum(['calendar','reminders']), identity:z.string(
 export const itemRestoreSchema = z.object({ ...syncIdentity, revision:revision.optional() }).strict()
 export const boundConflictSchema = z.object({ ...syncIdentity, choice:z.enum(['keep_apple','keep_alcor']), revision:revision.optional() }).strict()
 export const syncReviewSchema = z.discriminatedUnion('action', [
-  z.object({ ...syncIdentity, action:z.enum(['check_scan','check_missing','preview_legacy','compare_record','compare_identity']) }).strict(),
+  z.object({ ...syncIdentity, action:z.enum(['check_scan','restart_category_check','check_missing','preview_legacy','compare_record','compare_identity','open_apple_app']) }).strict(),
+  z.object({ kind:z.literal('reminders'), identity:syncIdentity.identity, action:z.literal('sync_completion') }).strict(),
   z.object({ ...syncIdentity, action:z.literal('keep_legacy'), revision }).strict(),
-  z.object({ kind:z.literal('calendar'), identity:syncIdentity.identity, action:z.literal('resume_verified_scan'), revision }).strict(),
+  z.object({ ...syncIdentity, action:z.literal('resume_verified_scan'), revision }).strict(),
 ])
 export const rebuildPreviewSchema = z.object({ kind:z.enum(['calendar','reminders']), apple_id:z.string().min(1).max(500), source_id:z.string().min(1).max(500) }).strict()
 export const rebuildCommitSchema = z.object({ ticket:z.string().uuid() }).strict()
